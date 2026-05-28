@@ -1,0 +1,103 @@
+﻿Analyzing 5 items...                                            
+
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:20:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:29:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:30:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:38:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:43:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:54:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:55:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:65:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:66:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:76:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:79:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:82:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:85:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:107:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:108:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:118:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:119:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:129:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:132:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:135:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:138:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:210:5 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:221:9 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:223:9 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:295:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:296:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:307:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:373:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:383:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:384:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:405:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:418:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:419:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:431:11 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:438:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:470:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:475:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:476:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:479:9 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:486:29 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:493:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:516:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:526:11 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:527:11 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:539:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:559:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:560:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:584:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:625:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:630:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:659:7 - avoid_print
+   info - Use the null-aware marker '?' rather than a null check via an 'if' - lib\auth_service.dart:686:9 - use_null_aware_elements
+   info - Use the null-aware marker '?' rather than a null check via an 'if' - lib\auth_service.dart:687:9 - use_null_aware_elements
+   info - Use the null-aware marker '?' rather than a null check via an 'if' - lib\auth_service.dart:688:9 - use_null_aware_elements
+   info - Use the null-aware marker '?' rather than a null check via an 'if' - lib\auth_service.dart:691:13 - use_null_aware_elements
+   info - Use the null-aware marker '?' rather than a null check via an 'if' - lib\auth_service.dart:692:13 - use_null_aware_elements
+   info - Use the null-aware marker '?' rather than a null check via an 'if' - lib\auth_service.dart:693:13 - use_null_aware_elements
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:697:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:698:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:709:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:710:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:726:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:734:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:744:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:745:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:781:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:789:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:799:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:800:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\auth_service.dart:816:7 - avoid_print
+warning - The value of the field '_cacheKeyCategories' isn't used - lib\cutomer_dashboard.dart:28:16 - unused_field
+   info - Don't invoke 'print' in production code - lib\cutomer_dashboard.dart:91:11 - avoid_print
+   info - Unnecessary use of multiple underscores - lib\cutomer_dashboard.dart:349:24 - unnecessary_underscores
+   info - Unnecessary use of multiple underscores - lib\cutomer_dashboard.dart:447:36 - unnecessary_underscores
+   info - Unnecessary use of multiple underscores - lib\cutomer_dashboard.dart:451:36 - unnecessary_underscores
+   info - Unnecessary use of multiple underscores - lib\cutomer_dashboard.dart:451:40 - unnecessary_underscores
+   info - Unnecessary use of multiple underscores - lib\provider_profile.dart:208:34 - unnecessary_underscores
+   info - Unnecessary use of multiple underscores - lib\provider_profile.dart:209:34 - unnecessary_underscores
+   info - Unnecessary use of multiple underscores - lib\provider_profile.dart:209:38 - unnecessary_underscores
+   info - Unnecessary use of multiple underscores - lib\provider_profile.dart:542:38 - unnecessary_underscores
+   info - Unnecessary use of multiple underscores - lib\provider_profile.dart:549:38 - unnecessary_underscores
+   info - Unnecessary use of multiple underscores - lib\provider_profile.dart:549:42 - unnecessary_underscores
+   info - Unnecessary use of multiple underscores - lib\provider_profile.dart:653:32 - unnecessary_underscores
+   info - Unnecessary use of multiple underscores - lib\provider_profile.dart:653:36 - unnecessary_underscores
+   info - Unnecessary use of multiple underscores - lib\user_jobs_page.dart:236:45 - unnecessary_underscores
+warning - The value of the field '_allCategories' isn't used - lib\user_jobs_page.dart:399:16 - unused_field
+   info - Don't invoke 'print' in production code - lib\user_jobs_page.dart:610:5 - avoid_print
+   info - Don't invoke 'print' in production code - lib\user_jobs_page.dart:611:5 - avoid_print
+   info - Don't invoke 'print' in production code - lib\user_jobs_page.dart:612:5 - avoid_print
+   info - Use the null-aware marker '?' rather than a null check via an 'if' - lib\user_jobs_page.dart:641:9 - use_null_aware_elements
+warning - The operand can't be 'null', so the condition is always 'true' - lib\user_jobs_page.dart:642:28 - unnecessary_null_comparison
+   info - 'value' is deprecated and shouldn't be used. Use initialValue instead. This will set the initial value for the form field. This feature was deprecated after v3.33.0-1.0.pre - lib\user_profile_page.dart:570:15 - deprecated_member_use
+
+flutter : 92 issues found. (ran in 3.3s)
+At line:1 char:1
++ flutter analyze lib/auth_service.dart lib/cutomer_dashboard.dart lib/ ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (92 issues found. (ran in 3.3s):St 
+   ring) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
