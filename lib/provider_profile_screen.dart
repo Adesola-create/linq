@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:io';
 
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -24,6 +25,8 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
   final _rateController = TextEditingController();
   final _bioController = TextEditingController();
   final _serviceSearchController = TextEditingController();
+  final _locationController = TextEditingController();
+  final _landmarkController = TextEditingController();
 
   // Mock model for local UI state. Replace with Riverpod/Provider in production.
   bool _isSaving = false;
@@ -31,28 +34,15 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
   String? _avatarUrl;
   final ImagePicker _picker = ImagePicker();
 
-  final List<String> _allServices = [
-    'Electrical',
-    'Plumbing',
-    'Carpentry',
-    'Cleaning',
-    'HVAC',
-    'Painting',
-    'Landscaping',
-    'Locksmith',
-    'Appliance Repair',
-  ];
-
-  final Map<String, List<String>> _serviceCategories = {
-    'Home Services': ['Cleaning', 'Painting', 'Landscaping'],
-    'Trade': ['Electrical', 'Plumbing', 'Carpentry'],
-    'Specialist': ['HVAC', 'Locksmith', 'Appliance Repair'],
-  };
-
   final List<String> _selectedServices = [];
+  final List<Map<String, dynamic>> _availableCategories = []; // {slug, name}
+  bool _categoriesLoading = false;
+  String? _categoriesError;
+
   String? _firstName;
   String? _lastName;
   String? _profileName;
+  String _locationLandmark = '';
   static const _profileDraftKey = 'provider_profile_draft_v1';
 
   String get _displayName {
@@ -86,6 +76,7 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
         _selectedServices.isNotEmpty ||
         _availability.values.any((v) => v.isNotEmpty) ||
         _locationAddress.isNotEmpty ||
+        _locationLandmark.isNotEmpty ||
         _photos.isNotEmpty;
   }
 
@@ -95,8 +86,15 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
     _bioController.addListener(() => setState(() {}));
     _rateController.addListener(() => setState(() {}));
     _serviceSearchController.addListener(() => setState(() {}));
-    // load saved profile from backend / cache, then offer draft restore if available
+    _locationController.addListener(() => setState(() {
+          _locationAddress = _locationController.text;
+        }));
+    _landmarkController.addListener(() => setState(() {
+          _locationLandmark = _landmarkController.text;
+        }));
+    // load saved profile + available categories from backend
     _loadProfile().then((_) => _offerDraftRestore());
+    _loadCategories();
   }
 
   @override
@@ -104,6 +102,8 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
     _bioController.dispose();
     _rateController.dispose();
     _serviceSearchController.dispose();
+    _locationController.dispose();
+    _landmarkController.dispose();
     super.dispose();
   }
 
@@ -346,6 +346,13 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
       'hourly_rate': _rateController.text.trim(),
       'services': _selectedServices,
       'location': _locationAddress.trim(),
+      'landmark': _locationLandmark.trim(),
+      'first_name': _firstName?.trim(),
+      'last_name': _lastName?.trim(),
+      'name': _displayName.isNotEmpty ? _displayName : null,
+      'workshop_location': _latitude != null && _longitude != null
+          ? {'lat': _latitude, 'lng': _longitude}
+          : null,
       // availability: serialize as list of {day: int, ranges: ['09:00-17:00']}
       'availability': _availability.entries
           .where((e) => e.value.isNotEmpty)
@@ -408,7 +415,7 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
 
   Future<void> _loadProfile() async {
     try {
-      final res = await AuthService.getProfile(forceRefresh: false);
+      final res = await AuthService.getProviderAccountProfile(forceRefresh: false);
       if (res['success'] == true) {
         final raw = res['data'];
         Map<String, dynamic>? source;
@@ -428,30 +435,58 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
         if (source != null) {
           final s = source; // local non-null alias for analyzer
           // Compute important derived values before mutating state so we can log them
-          final avatar = (s['avatar'] ?? s['photo_url'] ?? s['profile_photo'] ?? s['profile_photo_url']);
+          final avatar = (s['avatar'] ?? s['avatar_url'] ?? s['photo_url'] ?? s['profile_photo'] ?? s['profile_photo_url']);
           final computedName = _extractProfileName(s);
-          final svc = s['services'];
-          final loc = (s['location'] ?? s['address'] ?? '');
-          final photos = (s['photos'] is List) ? (s['photos'] as List).map((p) => p.toString()).toList() : <String>[];
+          final first = s['first_name']?.toString().trim();
+          final last = s['last_name']?.toString().trim();
+          final svc = s['services'] ?? s['category_slugs'] ?? s['service_categories'] ?? s['categories'];
+          final loc = (s['workshop_address'] ?? s['address'] ?? s['location'] ?? '');
+          final landmark = (s['landmark'] ?? s['workshop_landmark'] ?? '').toString();
+          final photoSource = s['photos'] ?? s['gallery_photos'] ?? s['gallery'] ?? s['work_photos'];
+          final photos = (photoSource is List)
+              ? photoSource.map((p) => p.toString()).toList()
+              : <String>[];
+          final workshopLocation = s['workshop_location'];
+          final availabilitySource = s['availability'] ?? s['availability_json'] ?? s['weekly_availability'];
 
           setState(() {
-            _bioController.text = (s['bio'] ?? s['description'] ?? '')
-                .toString();
-            _rateController.text = (s['hourly_rate'] ?? s['rate'] ?? '')
-                .toString();
+            _bioController.text = (s['bio'] ?? s['description'] ?? '').toString();
+            _rateController.text = (s['hourly_rate'] ?? s['rate'] ?? '').toString();
             if (svc is List) {
               _selectedServices.clear();
-              _selectedServices.addAll(svc.map((e) => e.toString()));
+              _selectedServices.addAll(
+                svc.map((e) {
+                  if (e is Map<String, dynamic>) {
+                    return (e['slug'] ?? e['name'] ?? e['title'] ?? e['label'] ?? e['category_slug'] ?? e['category_id'] ?? e['id'])?.toString() ?? '';
+                  }
+                  return e.toString();
+                }).where((item) => item.isNotEmpty),
+              );
             }
             _locationAddress = loc?.toString() ?? '';
+            _locationLandmark = landmark;
+            if (workshopLocation is Map<String, dynamic>) {
+              _latitude = (workshopLocation['lat'] ?? workshopLocation['latitude']) is num
+                  ? (workshopLocation['lat'] ?? workshopLocation['latitude']) as double?
+                  : double.tryParse((workshopLocation['lat'] ?? workshopLocation['latitude'] ?? '').toString());
+              _longitude = (workshopLocation['lng'] ?? workshopLocation['longitude']) is num
+                  ? (workshopLocation['lng'] ?? workshopLocation['longitude']) as double?
+                  : double.tryParse((workshopLocation['lng'] ?? workshopLocation['longitude'] ?? '').toString());
+            }
             _avatarUrl = avatar?.toString();
             _profileName = computedName;
+            _firstName = first?.isNotEmpty ?? false ? first : _firstName;
+            _lastName = last?.isNotEmpty ?? false ? last : _lastName;
+            _locationAddress = loc?.toString() ?? '';
+            _locationLandmark = landmark;
+            _locationController.text = _locationAddress;
+            _landmarkController.text = _locationLandmark;
             _photos
               ..clear()
               ..addAll(photos);
 
             // availability: try to parse if available
-            final avail = s['availability'];
+            final avail = availabilitySource;
             if (avail is List) {
               for (final item in avail) {
                 try {
@@ -466,7 +501,6 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
                             // Expect format '9:00 AM - 5:00 PM' or '09:00 - 17:00'
                             final parts = s.split('-').map((t) => t.trim()).toList();
                             if (parts.length == 2) {
-                              // try parse times using simple split
                               final parse = (String t) {
                                 final comp = t.split(RegExp(':| ')).where((x) => x.isNotEmpty).toList();
                                 final hour = int.tryParse(comp[0]) ?? 9;
@@ -483,13 +517,94 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
                   }
                 } catch (_) {}
               }
+            } else if (avail is Map<String, dynamic>) {
+              final dayNames = {
+                'monday': 1,
+                'tuesday': 2,
+                'wednesday': 3,
+                'thursday': 4,
+                'friday': 5,
+                'saturday': 6,
+                'sunday': 7,
+              };
+              for (final entry in avail.entries) {
+                final dayKey = entry.key?.toString().toLowerCase();
+                final day = dayNames[dayKey] ?? int.tryParse(dayKey ?? '');
+                final ranges = entry.value is List
+                    ? (entry.value as List).map((r) => r.toString()).toList()
+                    : <String>[];
+                if (day != null && day >= 1 && day <= 7 && ranges.isNotEmpty) {
+                  _availability[day] = ranges
+                      .map((s) {
+                        final parts = s.split('-').map((t) => t.trim()).toList();
+                        if (parts.length == 2) {
+                          final parse = (String t) {
+                            final comp = t.split(RegExp(':| ')).where((x) => x.isNotEmpty).toList();
+                            final hour = int.tryParse(comp[0]) ?? 9;
+                            final minute = int.tryParse(comp.length > 1 ? comp[1] : '0') ?? 0;
+                            return TimeOfDay(hour: hour, minute: minute);
+                          };
+                          return TimeRange(parse(parts[0]), parse(parts[1]));
+                        }
+                        return null;
+                      })
+                      .whereType<TimeRange>()
+                      .toList();
+                }
+              }
             }
           });
         }
       }
     } catch (e) {
-      print('[ProviderProfile] load profile error: $e');
     }
+  }
+
+  Future<void> _loadCategories() async {
+    setState(() {
+      _categoriesLoading = true;
+      _categoriesError = null;
+    });
+    try {
+      final res = await AuthService.getCategories(forceRefresh: false);
+      if (!mounted) return;
+      if (res['success'] == true) {
+        final raw = res['data'];
+        final list = (raw is List ? raw : <dynamic>[]).whereType<Map<String, dynamic>>();
+        setState(() {
+          _availableCategories.clear();
+          _availableCategories.addAll(list.map((category) {
+            final label = (category['name'] ?? category['title'] ?? category['label'] ?? category['slug'])?.toString() ?? '';
+            final slug = (category['slug'] ?? category['id'] ?? category['category_id'])?.toString() ?? label.toLowerCase().replaceAll(' ', '-');
+            return {'slug': slug, 'name': label};
+          }).where((item) => item['name'].toString().isNotEmpty));
+        });
+      } else {
+        setState(() {
+          _categoriesError = res['message']?.toString() ?? 'Unable to load categories.';
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _categoriesError = 'Unable to load services.';
+      });
+    } finally {
+      if (!mounted) return;
+      setState(() {
+        _categoriesLoading = false;
+      });
+    }
+  }
+
+  String _serviceLabel(String slug) {
+    return _availableCategories
+            .firstWhere(
+              (item) => item['slug'] == slug,
+              orElse: () => {'name': slug},
+            )['name']
+            .toString() ??
+        slug;
   }
 
   Future<void> _offerDraftRestore() async {
@@ -529,7 +644,10 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
               ? (draft['services'] as List).map((e) => e.toString())
               : <String>[]);
         _locationAddress = draft['location']?.toString() ?? '';
+        _locationLandmark = draft['landmark']?.toString() ?? '';
         _avatarUrl = draft['avatar_url']?.toString();
+        _firstName = draft['first_name']?.toString();
+        _lastName = draft['last_name']?.toString();
         _profileName = _extractProfileName(draft);
         _photos
           ..clear()
@@ -579,6 +697,10 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
       'hourly_rate': _rateController.text,
       'services': _selectedServices,
       'location': _locationAddress,
+      'landmark': _locationLandmark,
+      'first_name': _firstName,
+      'last_name': _lastName,
+      'name': _displayName,
       'avatar_url': _avatarUrl,
       'photos': _photos,
       'availability': _availability.entries
@@ -635,6 +757,8 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
                         // _buildHeaderCard(),
                         // const SizedBox(height: 12),
                         _buildAboutCard(),
+                        const SizedBox(height: 12),
+                        _buildNameCard(),
                         const SizedBox(height: 12),
                         _buildRateCard(),
                         const SizedBox(height: 12),
@@ -774,6 +898,36 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
 
   
 
+  Widget _buildNameCard() {
+    final username = _displayName.trim();
+    return _cardShell(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('Username', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 12),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.surfaceVariant,
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Text(
+              username.isNotEmpty ? username : 'No username available',
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Your registered username is shown here. It is collected during sign-up and does not need to be changed.',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.grey),
+          ),
+        ]),
+      ),
+    );
+  }
+
   Widget _buildAboutCard() {
     final bioText = _bioController.text.trim();
     final isEmpty = bioText.isEmpty;
@@ -871,7 +1025,17 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
 
   Widget _buildServicesCard() {
     final query = _serviceSearchController.text.toLowerCase();
-    final filtered = _allServices.where((s) => s.toLowerCase().contains(query)).toList();
+    final filtered = _availableCategories
+        .where((item) =>
+            item['name']
+                .toString()
+                .toLowerCase()
+                .contains(query) ||
+            item['slug']
+                .toString()
+                .toLowerCase()
+                .contains(query))
+        .toList();
     final hasServices = _selectedServices.isNotEmpty;
     return _cardShell(
       child: Padding(
@@ -885,7 +1049,16 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
             ],
           ),
           const SizedBox(height: 8),
-          if (_isEditing) ...[
+          if (_categoriesLoading)
+            Center(child: CircularProgressIndicator.adaptive())
+          else if (_categoriesError != null)
+            Text(_categoriesError!, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.red))
+          else if (_availableCategories.isEmpty)
+            Text(
+              'No service categories available yet. Try refreshing later.',
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Colors.grey),
+            )
+          else ...[
             TextField(
               controller: _serviceSearchController,
               decoration: const InputDecoration(
@@ -899,27 +1072,29 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
             Wrap(
               spacing: 8,
               runSpacing: 8,
-              children: filtered.map((s) {
-                final selected = _selectedServices.contains(s);
+              children: filtered.map((item) {
+                final slug = item['slug']?.toString() ?? '';
+                final label = item['name']?.toString() ?? slug;
+                final selected = _selectedServices.contains(slug);
                 return ChoiceChip(
-                  label: Text(s),
+                  label: Text(label),
                   selected: selected,
-                  onSelected: (_) => _toggleService(s),
+                  onSelected: _isEditing ? (_) => _toggleService(slug) : null,
                   elevation: selected ? 4 : 0,
                   selectedColor: Theme.of(context).colorScheme.primaryContainer,
                 );
               }).toList(),
             ),
-          ] else ...[
-            Text(
-              hasServices
-                  ? _selectedServices.join(', ')
-                  : 'Choose up to 5 services you specialize in so customers can find you faster.',
-              style: hasServices
-                  ? Theme.of(context).textTheme.bodyMedium
-                  : Theme.of(context).textTheme.bodyMedium?.copyWith(color: Colors.grey),
-            ),
           ],
+          const SizedBox(height: 12),
+          Text(
+            hasServices
+                ? _selectedServices.map(_serviceLabel).join(', ')
+                : 'Choose 1 to 5 service categories to match your expertise.',
+            style: hasServices
+                ? Theme.of(context).textTheme.bodyMedium
+                : Theme.of(context).textTheme.bodyMedium?.copyWith(color: Colors.grey),
+          ),
         ]),
       ),
     );
@@ -1000,27 +1175,34 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
   Widget _buildLocationCard() {
     final locationText = _locationAddress.trim();
     final isEmpty = locationText.isEmpty;
+    final landmarkText = _locationLandmark.trim();
     return _cardShell(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text('Workshop location', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 8),
-          if (_isEditing)
-            TextFormField(
-              initialValue: locationText,
-              onChanged: (v) => setState(() => _locationAddress = v),
-              decoration: const InputDecoration(border: InputBorder.none, hintText: 'Enter address or use current location'),
-            )
-          else
-            Text(
-              isEmpty
-                  ? 'Enter your location so customers know where you can work from or meet them nearby.'
-                  : locationText,
-              style: isEmpty
-                  ? Theme.of(context).textTheme.bodyMedium?.copyWith(color: Colors.grey)
-                  : Theme.of(context).textTheme.bodyMedium,
+          TextFormField(
+            controller: _locationController,
+            enabled: _isEditing,
+            decoration: const InputDecoration(
+              border: InputBorder.none,
+              hintText: 'Enter workshop address',
+              labelText: 'Address',
+              isDense: true,
             ),
+          ),
+          const SizedBox(height: 12),
+          TextFormField(
+            controller: _landmarkController,
+            enabled: _isEditing,
+            decoration: const InputDecoration(
+              border: InputBorder.none,
+              hintText: 'Add a nearby landmark (optional)',
+              labelText: 'Landmark',
+              isDense: true,
+            ),
+          ),
           const SizedBox(height: 12),
           Container(
             height: 120,
@@ -1028,7 +1210,14 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
               color: Theme.of(context).colorScheme.surfaceVariant,
               borderRadius: BorderRadius.circular(12),
             ),
-            child: Center(child: Text('Map preview (integrate Maps SDK)')),
+            child: Center(
+              child: Text(
+                _latitude != null && _longitude != null
+                    ? 'Location fixed at ${_latitude!.toStringAsFixed(4)}, ${_longitude!.toStringAsFixed(4)}'
+                    : 'Map preview (integrate Maps SDK)',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ),
           ),
           const SizedBox(height: 8),
           Row(
@@ -1048,7 +1237,7 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  'Customers only see a 500m radius',
+                  'Customers only see a 500m radius.',
                   style: Theme.of(context).textTheme.bodySmall,
                   softWrap: true,
                 ),
@@ -1082,48 +1271,110 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
               mainAxisSpacing: 8,
               crossAxisSpacing: 8,
             ),
-            itemCount: min(8, _photos.length + (_isEditing ? 1 : 0)),
+            itemCount: min(8, _photos.length + 1),
             itemBuilder: (context, index) {
               if (index < _photos.length) {
                 final url = _photos[index];
                 return GestureDetector(
                   onTap: () => showDialog(
-                      context: context,
-                      builder: (_) => Dialog(
-                            child: url.startsWith('http')
-                                ? Image.network(url, fit: BoxFit.cover)
-                                : Image.file(File(url), fit: BoxFit.cover),
-                          )),
+                    context: context,
+                    builder: (_) => Dialog(
+                      child: Stack(
+                        children: [
+                          url.startsWith('http')
+                              ? CachedNetworkImage(
+                                  imageUrl: url,
+                                  fit: BoxFit.cover,
+                                  width: double.infinity,
+                                  height: double.infinity,
+                                  placeholder: (_, __) => Container(
+                                    color: Colors.grey.shade200,
+                                  ),
+                                  errorWidget: (_, __, ___) => Container(
+                                    color: Colors.grey.shade200,
+                                    child: const Icon(Icons.broken_image, color: Colors.grey),
+                                  ),
+                                )
+                              : Image.file(File(url), fit: BoxFit.cover),
+                          Positioned(
+                            top: 8,
+                            right: 8,
+                            child: Material(
+                              color: Colors.black54,
+                              shape: const CircleBorder(),
+                              child: IconButton(
+                                icon: const Icon(Icons.delete, color: Colors.white, size: 18),
+                                onPressed: () {
+                                  Navigator.of(context).pop();
+                                  setState(() => _photos.removeAt(index));
+                                },
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
                   child: ClipRRect(
                     borderRadius: BorderRadius.circular(8),
-                    child: url.startsWith('http')
-                        ? Image.network(url, fit: BoxFit.cover)
-                        : Image.file(File(url), fit: BoxFit.cover),
-                  ),
-                );
-              }
-
-              if (_isEditing) {
-                return GestureDetector(
-                  onTap: _pickPhoto,
-                  child: Container(
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: Theme.of(context).dividerColor),
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        url.startsWith('http')
+                            ? CachedNetworkImage(
+                                imageUrl: url,
+                                fit: BoxFit.cover,
+                                placeholder: (_, __) => Container(color: Colors.grey.shade200),
+                                errorWidget: (_, __, ___) => Container(
+                                  color: Colors.grey.shade200,
+                                  child: const Icon(Icons.broken_image, color: Colors.grey),
+                                ),
+                              )
+                            : Image.file(File(url), fit: BoxFit.cover),
+                        Positioned(
+                          top: 6,
+                          right: 6,
+                          child: Material(
+                            color: Colors.black45,
+                            shape: const CircleBorder(),
+                            child: InkWell(
+                              onTap: () => setState(() => _photos.removeAt(index)),
+                              customBorder: const CircleBorder(),
+                              child: const Padding(
+                                padding: EdgeInsets.all(4),
+                                child: Icon(Icons.close, size: 16, color: Colors.white),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
-                    child: const Center(child: Icon(Icons.add)),
                   ),
                 );
               }
 
-              return Container();
+              return GestureDetector(
+                onTap: _isEditing ? _pickPhoto : null,
+                child: Container(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Theme.of(context).dividerColor),
+                  ),
+                  child: Center(
+                    child: Icon(
+                      Icons.add,
+                      color: _isEditing ? null : Colors.grey,
+                    ),
+                  ),
+                ),
+              );
             },
           ),
-          if (!hasPhotos && !_isEditing)
+          if (!hasPhotos)
             Padding(
               padding: const EdgeInsets.only(top: 12),
               child: Text(
-                'Add photos of your work when you tap Edit. Customers trust providers with real examples.',
+                'Add photos of your work to help customers trust your profile.',
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.grey),
               ),
             ),
@@ -1141,19 +1392,48 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
           Stack(
             alignment: Alignment.bottomRight,
             children: [
-              CircleAvatar(
-                radius: 56,
-                backgroundColor: Colors.grey.shade300,
-                foregroundImage: (_avatarUrl != null && _avatarUrl!.isNotEmpty)
-                    ? (_avatarUrl!.startsWith('http')
-                        ? NetworkImage(_avatarUrl!) as ImageProvider
-                        : (File(_avatarUrl!).existsSync()
-                            ? FileImage(File(_avatarUrl!)) as ImageProvider
-                            : null))
-                    : null,
-                child: (_avatarUrl == null || _avatarUrl!.isEmpty)
-                    ? Icon(Icons.person, size: 48, color: Colors.white)
-                    : null,
+              Container(
+                width: 112,
+                height: 112,
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade300,
+                  shape: BoxShape.circle,
+                ),
+                child: ClipOval(
+                  child: _avatarUrl != null && _avatarUrl!.isNotEmpty
+                      ? (_avatarUrl!.startsWith('http')
+                          ? CachedNetworkImage(
+                              imageUrl: _avatarUrl!,
+                              fit: BoxFit.cover,
+                              placeholder: (_, __) => Container(
+                                color: Colors.grey.shade300,
+                              ),
+                              errorWidget: (_, __, ___) => Container(
+                                color: Colors.grey.shade300,
+                                child: const Icon(
+                                  Icons.person,
+                                  size: 48,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            )
+                          : (File(_avatarUrl!).existsSync()
+                              ? Image.file(File(_avatarUrl!), fit: BoxFit.cover)
+                              : const Center(
+                                  child: Icon(
+                                    Icons.person,
+                                    size: 48,
+                                    color: Colors.white,
+                                  ),
+                                )))
+                      : const Center(
+                          child: Icon(
+                            Icons.person,
+                            size: 48,
+                            color: Colors.white,
+                          ),
+                        ),
+                ),
               ),
               if (_isEditing)
                 Material(
@@ -1169,7 +1449,7 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
           ),
           const SizedBox(height: 12),
           Text(
-            _displayName.isNotEmpty ? _displayName : 'Provider photo',
+            _displayName.isNotEmpty ? _displayName : 'Provider name',
             style: Theme.of(context).textTheme.bodyMedium,
           ),
           const SizedBox(height: 16),
@@ -1180,10 +1460,10 @@ class _ProviderProfileScreenState extends State<ProviderProfileScreen> {
 
   String _extractProfileName(Map<String, dynamic> source) {
     final validName = <String?>[
+      source['username']?.toString(),
       source['name']?.toString(),
       source['display_name']?.toString(),
       source['full_name']?.toString(),
-      source['username']?.toString(),
       source['provider_name']?.toString(),
       source['profile_name']?.toString(),
     ]

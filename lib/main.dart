@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'linq_theme.dart';
 
 import 'user_profile_page.dart' as user_profile;
@@ -17,17 +18,31 @@ import 'login.dart' as login;
 import 'market_analytics.dart' as market_analytics;
 import 'match_recommendation.dart' as match_recommendation;
 import 'Nearby_map.dart' as nearby_map;
+import 'notifications.dart' as customer_notifications;
 import 'provider_dashboard.dart' as provider_dashboard;
 import 'provider_hire_page.dart' as provider_hire_page;
 import 'provider_messages_page.dart' as provider_messages_page;
 import 'provider_profile_screen.dart' as provider_profile_screen;
+import 'provider_setup_page.dart' as provider_setup_page;
+import 'saved_providers_page.dart' as saved_providers_page;
 import 'provider_profile.dart';
+import 'customer_messages_page.dart' as customer_messages_page;
+import 'chat_page.dart' as chat_page;
 // import 'role_selection_screen.dart' as role_selection;
 import 'service_catalogue.dart' as service_catalogue;
 import 'splashscreen.dart' as splash;
+import 'user_verification_page.dart' as user_verification;
 import 'verification_screen.dart' as verification;
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setSystemUIOverlayStyle(
+    const SystemUiOverlayStyle(
+      statusBarColor: Colors.transparent,
+      statusBarIconBrightness: Brightness.dark,
+      statusBarBrightness: Brightness.light,
+    ),
+  );
   runApp(const LinqTrustApp());
 }
 
@@ -59,6 +74,11 @@ class AppRoutes {
   static const userProfile = '/user-profile';
   static const userJobs = '/user-jobs';
   static const userTransactions = '/user-transactions';
+  static const savedProviders = '/saved-providers';
+  static const notifications = '/notifications';
+  static const userVerification = '/user-verification';
+  static const customerMessages = '/messages';
+  static const chat = '/chat';
 }
 
 class LinqTrustApp extends StatelessWidget {
@@ -82,7 +102,7 @@ class LinqTrustApp extends StatelessWidget {
         AppRoutes.completeProfile: (context) =>
             const customer_profile.CompleteProfilePage(),
         AppRoutes.providerSetup: (context) =>
-            const provider_profile_screen.ProviderProfileScreen(),
+            const provider_setup_page.BusinessSetupPage(),
         AppRoutes.providerVerification: (context) =>
             const verification.VerificationScreen(),
         AppRoutes.customerDashboard: (context) =>
@@ -92,10 +112,31 @@ class LinqTrustApp extends StatelessWidget {
         AppRoutes.providerProfile: (context) {
           final routeSettings = ModalRoute.of(context);
           final args = routeSettings?.settings.arguments;
-          final provider = args is Map<String, dynamic>
-              ? args
-              : <String, dynamic>{};
-          return ProviderProfilePage(provider: provider);
+          late final Map<String, dynamic> provider;
+          bool showBottomNav = true;
+          bool hideHireActions = false;
+
+          if (args is Map<String, dynamic>) {
+            if (args['provider'] is Map<String, dynamic>) {
+              provider = args['provider'] as Map<String, dynamic>;
+            } else {
+              provider = args;
+            }
+            if (args['showBottomNav'] is bool) {
+              showBottomNav = args['showBottomNav'] as bool;
+            }
+            if (args['hideHireActions'] is bool) {
+              hideHireActions = args['hideHireActions'] as bool;
+            }
+          } else {
+            provider = <String, dynamic>{};
+          }
+
+          return ProviderProfilePage(
+            provider: provider,
+            showBottomNav: showBottomNav,
+            hideHireActions: hideHireActions,
+          );
         },
         AppRoutes.providerAccountProfile: (context) =>
             const provider_profile_screen.ProviderProfileScreen(),
@@ -136,6 +177,10 @@ class LinqTrustApp extends StatelessWidget {
         AppRoutes.userJobs: (context) => const user_jobs.UserJobsPage(),
         AppRoutes.userTransactions: (context) =>
             const user_transactions.UserTransactionsPage(),
+        AppRoutes.notifications: (context) =>
+            const customer_notifications.CustomerNotificationsPage(),
+        AppRoutes.userVerification: (context) =>
+            const user_verification.UserVerificationPage(),
         '/category': (context) {
           final routeSettings = ModalRoute.of(context);
           final args = routeSettings?.settings.arguments;
@@ -153,6 +198,17 @@ class LinqTrustApp extends StatelessWidget {
                 ? (parsedArgs['children'] as List).cast<Map<String, dynamic>>()
                 : <Map<String, dynamic>>[]),
           );
+        },
+        AppRoutes.savedProviders: (context) =>
+            const saved_providers_page.SavedProvidersPage(),
+        AppRoutes.customerMessages: (context) =>
+            const customer_messages_page.CustomerMessagesPage(),
+        AppRoutes.chat: (context) {
+          final args = ModalRoute.of(context)?.settings.arguments;
+          final thread = args is Map<String, dynamic>
+              ? args
+              : <String, dynamic>{};
+          return chat_page.ChatPage(thread: thread);
         },
       },
     );

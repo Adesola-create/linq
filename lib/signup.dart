@@ -1,6 +1,7 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'auth_service.dart';
+import 'google_auth_webview.dart';
 import 'linq_theme.dart';
 
 class RegistrationScreen extends StatefulWidget {
@@ -17,6 +18,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   final _emailCtrl = TextEditingController();
   final _phoneCtrl = TextEditingController();
   final _passwordCtrl = TextEditingController();
+  final _confirmPasswordCtrl = TextEditingController();
   bool _obscurePassword = true;
   bool _agreed = false;
   String? _selectedRole;
@@ -30,16 +32,64 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
     _emailCtrl.dispose();
     _phoneCtrl.dispose();
     _passwordCtrl.dispose();
+    _confirmPasswordCtrl.dispose();
     super.dispose();
   }
 
   Future<void> _googleSignIn() async {
-    setState(() { _loading = true; _errorMessage = null; });
-    final result = await AuthService.signInWithGoogle();
+    if (_selectedRole == null) {
+      setState(
+        () => _errorMessage = 'Please select "I am a..." before continuing with Google.',
+      );
+      return;
+    }
+
+    setState(() {
+      _loading = true;
+      _errorMessage = null;
+    });
+
+    final apiRole = _selectedRole == 'user' ? 'customer' : 'provider';
+
+    final urlResult = await AuthService.getGoogleAuthUrl(role: apiRole);
+    if (!mounted) return;
+    if (urlResult['success'] != true) {
+      setState(() {
+        _loading = false;
+        _errorMessage = urlResult['message'];
+      });
+      return;
+    }
+
+    final params = await Navigator.push<Map<String, String>?>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => GoogleAuthWebViewPage(
+          authUrl: urlResult['redirect_url'],
+          callbackUrlPrefix: AuthService.googleCallbackUrlPrefix,
+        ),
+      ),
+    );
+    if (!mounted) return;
+
+    final code = params?['code'];
+    if (code == null) {
+      setState(() => _loading = false);
+      return;
+    }
+
+    final result = await AuthService.completeGoogleAuth(
+      code: code,
+      state: params?['state'] ?? '',
+      role: apiRole,
+    );
     if (!mounted) return;
     setState(() => _loading = false);
+
     if (result['success'] == true) {
-      final route = result['role'] == 'provider' ? '/provider-dashboard' : '/customer-dashboard';
+      final route = result['role'] == 'provider'
+          ? '/provider-dashboard'
+          : '/customer-dashboard';
       Navigator.pushNamedAndRemoveUntil(context, route, (_) => false);
     } else {
       setState(() => _errorMessage = result['message']);
@@ -52,7 +102,10 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
       setState(() => _errorMessage = 'You must agree to the Terms of Service.');
       return;
     }
-    setState(() { _loading = true; _errorMessage = null; });
+    setState(() {
+      _loading = true;
+      _errorMessage = null;
+    });
 
     final result = await AuthService.register(
       firstName: _firstNameCtrl.text.trim(),
@@ -67,10 +120,16 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
     setState(() => _loading = false);
 
     if (result['success'] == true) {
-      final route = result['role'] == 'provider'
-          ? '/provider-dashboard'
-          : '/customer-dashboard';
-      Navigator.pushNamedAndRemoveUntil(context, route, (_) => false);
+      await AuthService.setActiveRole(
+        'customer',
+        email: _emailCtrl.text.trim(),
+      );
+      if (!mounted) return;
+      Navigator.pushNamedAndRemoveUntil(
+        context,
+        '/customer-dashboard',
+        (_) => false,
+      );
     } else {
       setState(() => _errorMessage = result['message']);
     }
@@ -87,7 +146,13 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
           children: [
             const Icon(Icons.verified_user, color: LinqColors.forest500),
             const SizedBox(width: 8),
-            Text('LINQ', style: LinqTextStyles.h4.copyWith(color: LinqColors.forest500, letterSpacing: 2)),
+            Text(
+              'LINQ',
+              style: LinqTextStyles.h4.copyWith(
+                color: LinqColors.forest500,
+                letterSpacing: 2,
+              ),
+            ),
           ],
         ),
       ),
@@ -98,7 +163,12 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
             child: Container(
               constraints: const BoxConstraints(maxWidth: 1200),
               child: isDesktop
-                  ? Row(children: [Expanded(child: _leftPanel()), Expanded(child: _rightPanel())])
+                  ? Row(
+                      children: [
+                        Expanded(child: _leftPanel()),
+                        Expanded(child: _rightPanel()),
+                      ],
+                    )
                   : _rightPanel(),
             ),
           );
@@ -120,21 +190,35 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
             children: [
               linqVerifiedBadge(),
               const SizedBox(height: 20),
-              Text('The gold standard for secure service.',
-                  style: LinqTextStyles.h2.copyWith(color: LinqColors.textOnBrand)),
+              Text(
+                'The gold standard for secure service.',
+                style: LinqTextStyles.h2.copyWith(
+                  color: LinqColors.textOnBrand,
+                ),
+              ),
               const SizedBox(height: 12),
               Text(
                 'Join an elite network of verified professionals and clients.',
-                style: LinqTextStyles.body.copyWith(color: LinqColors.forest100),
+                style: LinqTextStyles.body.copyWith(
+                  color: LinqColors.forest100,
+                ),
               ),
             ],
           ),
           Row(
             children: [
-              CircleAvatar(backgroundImage: CachedNetworkImageProvider('https://i.pravatar.cc/150?img=12')),
+              CircleAvatar(
+                backgroundImage: CachedNetworkImageProvider(
+                  'https://i.pravatar.cc/150?img=12',
+                ),
+              ),
               const SizedBox(width: 10),
-              Text('Join 2,400+ verified partners today.',
-                  style: LinqTextStyles.bodySm.copyWith(color: LinqColors.forest200)),
+              Text(
+                'Join 2,400+ verified partners today.',
+                style: LinqTextStyles.bodySm.copyWith(
+                  color: LinqColors.forest200,
+                ),
+              ),
             ],
           ),
         ],
@@ -156,23 +240,37 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const SizedBox(height: 6),
-                  Text('Create account', style: LinqTextStyles.h2.copyWith(color: LinqColors.forest500)),
+                  Text(
+                    'Create account',
+                    style: LinqTextStyles.h2.copyWith(
+                      color: LinqColors.forest500,
+                    ),
+                  ),
                   const SizedBox(height: 4),
-                  Text('Start your secure journey with LINQ today.',
-                      style: LinqTextStyles.bodySm.copyWith(color: LinqColors.textSecondary)),
+                  Text(
+                    'Start your secure journey with LINQ today.',
+                    style: LinqTextStyles.bodySm.copyWith(
+                      color: LinqColors.textSecondary,
+                    ),
+                  ),
                   const SizedBox(height: 16),
 
                   SizedBox(width: double.infinity, child: _googleBtn()),
                   const SizedBox(height: 14),
 
-                  const Row(children: [
-                    Expanded(child: Divider()),
-                    Padding(
-                      padding: EdgeInsets.symmetric(horizontal: 10),
-                      child: Text("OR", style: TextStyle(color: Colors.black38)),
-                    ),
-                    Expanded(child: Divider()),
-                  ]),
+                  const Row(
+                    children: [
+                      Expanded(child: Divider()),
+                      Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 10),
+                        child: Text(
+                          "OR",
+                          style: TextStyle(color: Colors.black38),
+                        ),
+                      ),
+                      Expanded(child: Divider()),
+                    ],
+                  ),
                   const SizedBox(height: 14),
 
                   if (_errorMessage != null) ...[
@@ -185,11 +283,19 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                       ),
                       child: Row(
                         children: [
-                          const Icon(Icons.error_outline, color: LinqColors.danger500, size: 18),
+                          const Icon(
+                            Icons.error_outline,
+                            color: LinqColors.danger500,
+                            size: 18,
+                          ),
                           const SizedBox(width: 8),
                           Expanded(
-                            child: Text(_errorMessage!,
-                                style: LinqTextStyles.bodySm.copyWith(color: LinqColors.danger700)),
+                            child: Text(
+                              _errorMessage!,
+                              style: LinqTextStyles.bodySm.copyWith(
+                                color: LinqColors.danger700,
+                              ),
+                            ),
                           ),
                         ],
                       ),
@@ -203,16 +309,26 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                       Expanded(
                         child: TextFormField(
                           controller: _firstNameCtrl,
-                          decoration: linqInputDecoration(label: 'First name', icon: Icons.person_outline),
-                          validator: (v) => (v == null || v.trim().isEmpty) ? 'Required.' : null,
+                          decoration: linqInputDecoration(
+                            label: 'First name',
+                            icon: Icons.person_outline,
+                          ),
+                          validator: (v) => (v == null || v.trim().isEmpty)
+                              ? 'Required.'
+                              : null,
                         ),
                       ),
                       const SizedBox(width: 10),
                       Expanded(
                         child: TextFormField(
                           controller: _lastNameCtrl,
-                          decoration: linqInputDecoration(label: 'Last name', icon: Icons.person_outline),
-                          validator: (v) => (v == null || v.trim().isEmpty) ? 'Required.' : null,
+                          decoration: linqInputDecoration(
+                            label: 'Last name',
+                            icon: Icons.person_outline,
+                          ),
+                          validator: (v) => (v == null || v.trim().isEmpty)
+                              ? 'Required.'
+                              : null,
                         ),
                       ),
                     ],
@@ -223,10 +339,17 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                   TextFormField(
                     controller: _emailCtrl,
                     keyboardType: TextInputType.emailAddress,
-                    decoration: linqInputDecoration(label: 'Email address', icon: Icons.email_outlined),
+                    decoration: linqInputDecoration(
+                      label: 'Email address',
+                      icon: Icons.email_outlined,
+                    ),
                     validator: (v) {
-                      if (v == null || v.trim().isEmpty) return 'Email is required.';
-                      if (!RegExp(r'^[\w-.]+@([\w-]+\.)+[\w-]{2,4}$').hasMatch(v.trim())) return 'Enter a valid email.';
+                      if (v == null || v.trim().isEmpty)
+                        return 'Email is required.';
+                      if (!RegExp(
+                        r'^[\w-.]+@([\w-]+\.)+[\w-]{2,4}$',
+                      ).hasMatch(v.trim()))
+                        return 'Enter a valid email.';
                       return null;
                     },
                   ),
@@ -236,21 +359,34 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                   TextFormField(
                     controller: _phoneCtrl,
                     keyboardType: TextInputType.phone,
-                    decoration: linqInputDecoration(label: 'Phone number', icon: Icons.phone_outlined),
-                    validator: (v) => (v == null || v.trim().isEmpty) ? 'Phone number is required.' : null,
+                    decoration: linqInputDecoration(
+                      label: 'Phone number',
+                      icon: Icons.phone_outlined,
+                    ),
+                    validator: (v) => (v == null || v.trim().isEmpty)
+                        ? 'Phone number is required.'
+                        : null,
                   ),
                   const SizedBox(height: 10),
 
                   // Role
                   DropdownButtonFormField<String>(
                     value: _selectedRole,
-                    decoration: linqInputDecoration(label: 'I am a...', icon: Icons.work_outline),
+                    isExpanded: true,
+                    decoration: linqInputDecoration(
+                      label: 'I am a...',
+                      icon: Icons.work_outline,
+                    ),
                     items: const [
-                      DropdownMenuItem(value: 'user', child: Text('User — Hire a Pro')),
-                      DropdownMenuItem(value: 'provider', child: Text('Service Provider')),
+                      DropdownMenuItem(value: 'user', child: Text('Customer')),
+                      DropdownMenuItem(
+                        value: 'provider',
+                        child: Text('Service Provider'),
+                      ),
                     ],
                     onChanged: (val) => setState(() => _selectedRole = val),
-                    validator: (v) => v == null ? 'Please select your role.' : null,
+                    validator: (v) =>
+                        v == null ? 'Please select your role.' : null,
                   ),
                   const SizedBox(height: 10),
 
@@ -264,17 +400,43 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                       helper: 'Min 10 chars, 1 uppercase, 1 lowercase',
                       suffix: IconButton(
                         icon: Icon(
-                          _obscurePassword ? Icons.visibility : Icons.visibility_off,
-                          color: LinqColors.forest500, size: 20,
+                          _obscurePassword
+                              ? Icons.visibility
+                              : Icons.visibility_off,
+                          color: LinqColors.forest500,
+                          size: 20,
                         ),
-                        onPressed: () => setState(() => _obscurePassword = !_obscurePassword),
+                        onPressed: () => setState(
+                          () => _obscurePassword = !_obscurePassword,
+                        ),
                       ),
                     ),
                     validator: (v) {
-                      if (v == null || v.isEmpty) return 'Password is required.';
+                      if (v == null || v.isEmpty)
+                        return 'Password is required.';
                       if (v.length < 10) return 'Min 10 characters required.';
-                      if (!RegExp(r'[A-Z]').hasMatch(v)) return 'Add at least one uppercase letter (A-Z).';
-                      if (!RegExp(r'[a-z]').hasMatch(v)) return 'Add at least one lowercase letter (a-z).';
+                      if (!RegExp(r'[A-Z]').hasMatch(v))
+                        return 'Add at least one uppercase letter (A-Z).';
+                      if (!RegExp(r'[a-z]').hasMatch(v))
+                        return 'Add at least one lowercase letter (a-z).';
+                      return null;
+                    },
+                  ),
+                  const SizedBox(height: 10),
+
+                  // Confirm password
+                  TextFormField(
+                    controller: _confirmPasswordCtrl,
+                    obscureText: _obscurePassword,
+                    decoration: linqInputDecoration(
+                      label: 'Confirm password',
+                      icon: Icons.lock_outline,
+                    ),
+                    validator: (v) {
+                      if (v == null || v.isEmpty)
+                        return 'Please confirm your password.';
+                      if (v != _passwordCtrl.text)
+                        return 'Passwords do not match.';
                       return null;
                     },
                   ),
@@ -291,7 +453,9 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                       Expanded(
                         child: Text(
                           'I agree to the Terms of Service and Privacy Policy.',
-                          style: LinqTextStyles.bodySm.copyWith(color: LinqColors.textBody),
+                          style: LinqTextStyles.bodySm.copyWith(
+                            color: LinqColors.textBody,
+                          ),
                         ),
                       ),
                     ],
@@ -304,8 +468,21 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                       style: linqPrimaryButton(verticalPadding: 16),
                       onPressed: _loading ? null : _submit,
                       child: _loading
-                          ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-                          : const Text('Sign up', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                          ? const SizedBox(
+                              height: 20,
+                              width: 20,
+                              child: CircularProgressIndicator(
+                                color: Colors.white,
+                                strokeWidth: 2,
+                              ),
+                            )
+                          : const Text(
+                              'Sign up',
+                              style: TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
                     ),
                   ),
                   const SizedBox(height: 14),
@@ -313,9 +490,16 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                   Center(
                     child: TextButton(
                       onPressed: () => Navigator.pushNamed(context, '/login'),
-                      style: TextButton.styleFrom(foregroundColor: LinqColors.forest500),
-                      child: Text('Already have an account? Log in',
-                          style: LinqTextStyles.bodySm.copyWith(color: LinqColors.forest500, fontWeight: FontWeight.w500)),
+                      style: TextButton.styleFrom(
+                        foregroundColor: LinqColors.forest500,
+                      ),
+                      child: Text(
+                        'Already have an account? Log in',
+                        style: LinqTextStyles.bodySm.copyWith(
+                          color: LinqColors.forest500,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
                     ),
                   ),
                 ],
@@ -335,10 +519,13 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
         height: 20,
         width: 20,
         fit: BoxFit.contain,
-        errorWidget: (_, __, ___) => const Icon(Icons.g_mobiledata, color: Color(0xFF001B44)),
+        errorWidget: (_, __, ___) =>
+            const Icon(Icons.g_mobiledata, color: Color(0xFF001B44)),
       ),
-      label: Text('Continue with Google',
-          style: LinqTextStyles.label.copyWith(color: LinqColors.forest500)),
+      label: Text(
+        'Continue with Google',
+        style: LinqTextStyles.label.copyWith(color: LinqColors.forest500),
+      ),
       style: OutlinedButton.styleFrom(
         side: const BorderSide(color: LinqColors.borderDefault),
         padding: const EdgeInsets.symmetric(vertical: 14),

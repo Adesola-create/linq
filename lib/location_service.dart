@@ -7,9 +7,11 @@ class LocationService {
   static const _keyLng = 'user_lng';
   static const _keyCountry = 'user_country';
   static const _keyState = 'user_state';
+  static const _keyLga = 'user_lga';
+  static const _keyArea = 'user_area';
 
   /// Requests permission and fetches current position with reverse geocoding.
-  /// Saves to local storage and returns the position with country/state.
+  /// Saves to local storage and returns the position with country/state/lga/area.
   static Future<Map<String, dynamic>> fetchLocation() async {
     try {
       final serviceEnabled = await Geolocator.isLocationServiceEnabled();
@@ -48,25 +50,27 @@ class LocationService {
         position.longitude,
       );
 
-      String? country = placemarks.isNotEmpty ? placemarks.first.country : null;
-      String? state = placemarks.isNotEmpty
-          ? placemarks.first.administrativeArea
-          : null;
+      final placemark = placemarks.isNotEmpty ? placemarks.first : null;
+      String? country = placemark?.country;
+      String? state = placemark?.administrativeArea;
+      String? lga = placemark?.subAdministrativeArea;
+      String? area = (placemark?.locality?.isNotEmpty ?? false)
+          ? placemark!.locality
+          : placemark?.subLocality;
 
-      await _saveLocation(position.latitude, position.longitude, country, state);
+      await _saveLocation(
+          position.latitude, position.longitude, country, state, lga, area);
 
-      print(
-        '[LocationService] lat: ${position.latitude}, lng: ${position.longitude}, country: $country, state: $state',
-      );
       return {
         'success': true,
         'lat': position.latitude,
         'lng': position.longitude,
         'country': country,
         'state': state,
+        'lga': lga,
+        'area': area,
       };
     } catch (e) {
-      print('[LocationService] error: $e');
       return {
         'success': false,
         'message': 'Unable to get location. Please try again.',
@@ -85,14 +89,19 @@ class LocationService {
       'lng': lng,
       'country': prefs.getString(_keyCountry),
       'state': prefs.getString(_keyState),
+      'lga': prefs.getString(_keyLga),
+      'area': prefs.getString(_keyArea),
     };
   }
 
-  static Future<void> _saveLocation(double lat, double lng, String? country, String? state) async {
+  static Future<void> _saveLocation(double lat, double lng, String? country,
+      String? state, String? lga, String? area) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble(_keyLat, lat);
     await prefs.setDouble(_keyLng, lng);
     if (country != null) await prefs.setString(_keyCountry, country);
     if (state != null) await prefs.setString(_keyState, state);
+    if (lga != null) await prefs.setString(_keyLga, lga);
+    if (area != null) await prefs.setString(_keyArea, area);
   }
 }

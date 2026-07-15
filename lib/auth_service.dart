@@ -1,50 +1,181 @@
 import 'dart:convert';
 import 'dart:io';
-import 'package:google_sign_in/google_sign_in.dart';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 class AuthService {
   static const String _baseUrl = 'https://api.linq.ng/api/v1';
   static const String _tokenExpiryKey = 'token_expiry';
+  static const String _currentAccountEmailKey = 'current_account_email';
+  static const String _pendingInterruptedRouteKey = 'pending_interrupted_route';
 
-  static final _googleSignIn = GoogleSignIn(scopes: ['email', 'profile']);
+  // Registered with Google as the OAuth client's authorized redirect URI.
+  // The Google auth WebView watches for navigation to this prefix and
+  // intercepts it instead of letting it load, pulling `code`/`state` off
+  // the URL itself rather than hitting this (GET, browser-facing) route.
+  static const String googleCallbackUrlPrefix =
+      'https://api.linq.ng/api/v1/auth/google/callback';
+
   static String? _cachedToken;
   static int? _cachedTokenExpiryMs;
 
-  static Future<Map<String, dynamic>> signInWithGoogle() async {
+  // Incremented every time a provider is successfully saved or unsaved.
+  // Any widget that shows a bookmark icon listens to this and re-checks
+  // its saved state so all cards stay in sync without a full page reload.
+  static final ValueNotifier<int> savedProvidersVersion = ValueNotifier(0);
+
+  // Total unread message count across all threads. Listened to by the
+  // dashboard app bar badge. Call refreshUnreadMessageCount() to update.
+  static final ValueNotifier<int> unreadMessageCount = ValueNotifier(0);
+
+  // Total unread notification count. Listened to by the dashboard bell badge.
+  static final ValueNotifier<int> unreadNotificationCount = ValueNotifier(0);
+
+  static Future<void> refreshUnreadNotificationCount() async {
     try {
-      final googleUser = await _googleSignIn.signIn();
-      if (googleUser == null)
-        return {'success': false, 'message': 'Google sign-in was cancelled.'};
+      final result = await getNotifications(limit: 50, offset: 0);
+      if (result['success'] == true) {
+        final raw = result['data'];
+        final list = raw is List
+            ? raw
+            : raw is Map
+                ? (raw['data'] is List
+                    ? raw['data']
+                    : raw['notifications'] is List
+                        ? raw['notifications']
+                        : <dynamic>[])
+                : <dynamic>[];
+        int count = 0;
+        for (final item in list) {
+          if (item is Map) {
+            final readAt = item['read_at'] ?? item['readAt'];
+            final isRead = item['is_read'] ?? item['read'];
+            bool unread;
+            if (readAt != null && readAt.toString().trim().isNotEmpty) {
+              unread = false;
+            } else if (isRead is bool) {
+              unread = !isRead;
+            } else if (isRead is num) {
+              unread = isRead == 0;
+            } else {
+              unread = true;
+            }
+            if (unread) count++;
+          }
+        }
+        unreadNotificationCount.value = count;
+      }
+    } catch (_) {}
+  }
 
-      final googleAuth = await googleUser.authentication;
-      final idToken = googleAuth.idToken;
+  static Future<void> markNotificationRead(String ulid) async {
+    try {
+      final token = await getToken();
+      if (token == null || token.isEmpty) return;
+      await _sendWithAuthRetry(
+        (headers) => http
+            .post(
+              Uri.parse('$_baseUrl/notifications/$ulid/read'),
+              headers: headers,
+            )
+            .timeout(const Duration(seconds: 10)),
+      );
+    } catch (_) {}
+  }
 
-      print('[AuthService] GOOGLE id_token: $idToken');
+  static Future<void> markAllNotificationsRead() async {
+    try {
+      final token = await getToken();
+      if (token == null || token.isEmpty) return;
+      await _sendWithAuthRetry(
+        (headers) => http
+            .post(
+              Uri.parse('$_baseUrl/notifications/read-all'),
+              headers: headers,
+            )
+            .timeout(const Duration(seconds: 10)),
+      );
+      unreadNotificationCount.value = 0;
+    } catch (_) {}
+  }
 
-      // Send token to backend
-      final res = await http
-          .post(
-            Uri.parse('$_baseUrl/auth/google'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({'id_token': idToken}),
-          )
-          .timeout(const Duration(seconds: 15));
+  static Future<void> refreshUnreadMessageCount() async {
+    try {
+      final result = await getThreads();
+      if (result['success'] != true) return;
+      final threads = result['data'] as List<dynamic>? ?? [];
+      int total = 0;
+      for (final t in threads) {
+        if (t is Map) {
+          final v = t['unread_count'] ?? t['unread_messages_count'] ?? 0;
+          total += v is int ? v : int.tryParse(v.toString()) ?? 0;
+        }
+      }
+      unreadMessageCount.value = total;
+    } catch (_) {}
+  }
 
-      print('[AuthService] GOOGLE status: ${res.statusCode}');
-      print('[AuthService] GOOGLE response: ${res.body}');
+  // Guards concurrent 401 handlers from racing to clear the session.
+  static bool _sessionBeingCleared = false;
+
+  // Set when the session has been invalidated and a redirect to /login is
+  // already in flight. Cleared on the next successful login. Callers check
+  // this before navigating so only the first handler ever navigates.
+  static bool _redirectingToLogin = false;
+
+  /// Returns true if a redirect to login is already in progress.
+  /// Widgets should check this before calling Navigator.pushNamedAndRemoveUntil('/login').
+  static bool get redirectingToLogin => _redirectingToLogin;
+
+  /// Call immediately before navigating to login after an auth failure.
+  /// Returns false if another handler already claimed the redirect — caller
+  /// should skip navigation in that case.
+  static bool claimLoginRedirect() {
+    if (_redirectingToLogin) return false;
+    _redirectingToLogin = true;
+    return true;
+  }
+
+  /// Called by the login screen once the user has successfully authenticated,
+  /// to allow future auth failures to redirect again.
+  static void resetLoginRedirect() {
+    _redirectingToLogin = false;
+  }
+
+  /// Step 1 of the Google OAuth flow: ask the backend for a Google
+  /// authorisation URL (and a CSRF `state` cached server-side for 10 min).
+  /// [role] pre-selects the persona to create/use; omit to let the
+  /// callback step determine it.
+  static Future<Map<String, dynamic>> getGoogleAuthUrl({String? role}) async {
+    try {
+      final uri = Uri.parse('$_baseUrl/auth/google').replace(
+        queryParameters: (role != null && role.isNotEmpty)
+            ? {'role': role}
+            : null,
+      );
+      final res = await http.get(uri).timeout(const Duration(seconds: 15));
+
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        final data = jsonDecode(res.body) as Map<String, dynamic>;
+        final payload = _asStringKeyedMap(data['data']) ?? data;
+        final redirectUrl =
+            _toString(payload['redirect_url']) ??
+            _toString(payload['url']) ??
+            _toString(data['redirect_url']);
+        if (redirectUrl == null || redirectUrl.isEmpty) {
+          return {
+            'success': false,
+            'message': 'Unable to start Google sign-in. Please try again.',
+          };
+        }
+        return {'success': true, 'redirect_url': redirectUrl};
+      }
 
       final data = jsonDecode(res.body);
-      if (res.statusCode == 200 || res.statusCode == 201) {
-        await _saveSession(data);
-        return {'success': true, 'role': _extractRole(data)};
-      }
-      final msg = _extractMessage(data) ?? '';
-      print('[AuthService] GOOGLE failed: $msg');
       return {
         'success': false,
-        'message': 'Google sign-in failed. Please try again.',
+        'message': _extractMessage(data) ?? 'Unable to start Google sign-in.',
       };
     } on SocketException {
       return {
@@ -52,12 +183,91 @@ class AuthService {
         'message': 'No internet connection. Please check your network.',
       };
     } catch (e) {
-      print('[AuthService] GOOGLE error: $e');
+      return {
+        'success': false,
+        'message': 'Unable to start Google sign-in. Please try again.',
+      };
+    }
+  }
+
+  /// Step 2 of the Google OAuth flow: exchange the authorisation `code`
+  /// (and matching `state`) captured from Google's redirect for a LINQ
+  /// session. Three outcomes are possible per the API: `authenticated`
+  /// (session issued), `needs_phone` (new Google identity — phone number
+  /// required to finish registration), `needs_role` (email matches
+  /// multiple personas — role selection required).
+  static Future<Map<String, dynamic>> completeGoogleAuth({
+    required String code,
+    required String state,
+    String? role,
+  }) async {
+    try {
+      final res = await http
+          .post(
+            Uri.parse('$_baseUrl/auth/google/callback'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'code': code,
+              'state': state,
+              if (role != null && role.isNotEmpty) 'role': role,
+            }),
+          )
+          .timeout(const Duration(seconds: 15));
+
+      final data = jsonDecode(res.body) as Map<String, dynamic>;
+
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        final status = _extractGoogleAuthStatus(data, res.body);
+        if (status == 'needs_phone' || status == 'needs_role') {
+          return {
+            'success': false,
+            'status': status,
+            'message': status == 'needs_phone'
+                ? 'A phone number is required to finish creating your account.'
+                : 'This Google account is linked to more than one role. Please choose how to continue.',
+          };
+        }
+        await _saveSession(data);
+        return {
+          'success': true,
+          'status': 'authenticated',
+          'role': _extractRole(data),
+          'email': _extractEmail(data),
+        };
+      }
+
+      return {
+        'success': false,
+        'message': _extractMessage(data) ?? 'Google sign-in failed. Please try again.',
+      };
+    } on SocketException {
+      return {
+        'success': false,
+        'message': 'No internet connection. Please check your network.',
+      };
+    } catch (e) {
       return {
         'success': false,
         'message': 'Google sign-in failed. Please try again.',
       };
     }
+  }
+
+  /// The callback response's outcome field isn't documented by name, so
+  /// check the common shapes first and fall back to scanning the raw body
+  /// for the literal outcome strings the API docs specify.
+  static String _extractGoogleAuthStatus(
+    Map<String, dynamic> data,
+    String rawBody,
+  ) {
+    final payload = _asStringKeyedMap(data['data']);
+    for (final key in ['status', 'outcome', 'result', 'next_step', 'next']) {
+      final value = _toString(data[key]) ?? _toString(payload?[key]);
+      if (value != null && value.isNotEmpty) return value;
+    }
+    if (rawBody.contains('needs_phone')) return 'needs_phone';
+    if (rawBody.contains('needs_role')) return 'needs_role';
+    return 'authenticated';
   }
 
   static Future<Map<String, dynamic>> login({
@@ -66,8 +276,6 @@ class AuthService {
   }) async {
     try {
       final requestBody = jsonEncode({'email': email, 'password': password});
-      print('[AuthService] LOGIN → $_baseUrl/auth/login');
-      print('[AuthService] LOGIN body: $requestBody');
 
       final res = await http
           .post(
@@ -77,18 +285,15 @@ class AuthService {
           )
           .timeout(const Duration(seconds: 15));
 
-      print('[AuthService] LOGIN status: ${res.statusCode}');
-      print('[AuthService] LOGIN response: ${res.body}');
 
       final data = jsonDecode(res.body);
 
       if (res.statusCode == 200) {
         await _saveSession(data);
-        return {'success': true, 'role': _extractRole(data)};
+        return {'success': true, 'role': _extractRole(data), 'email': email};
       }
 
       final rawMessage = _extractMessage(data) ?? '';
-      print('[AuthService] LOGIN failed: $rawMessage');
       return {
         'success': false,
         'message': rawMessage.isNotEmpty
@@ -96,20 +301,17 @@ class AuthService {
             : _friendlyLoginError(res.statusCode),
       };
     } on SocketException catch (e) {
-      print('[AuthService] LOGIN SocketException: $e');
       return {
         'success': false,
         'message':
             'No internet connection. Please check your network and try again.',
       };
     } on HttpException catch (e) {
-      print('[AuthService] LOGIN HttpException: $e');
       return {
         'success': false,
         'message': 'Unable to reach the server. Please try again later.',
       };
     } catch (e) {
-      print('[AuthService] LOGIN error: $e');
       return {
         'success': false,
         'message': 'Something went wrong. Please try again.',
@@ -134,8 +336,6 @@ class AuthService {
         'password': password,
         'role': role == 'user' ? 'customer' : 'provider',
       });
-      print('[AuthService] REGISTER → $_baseUrl/auth/register');
-      print('[AuthService] REGISTER body: $requestBody');
 
       final res = await http
           .post(
@@ -145,8 +345,6 @@ class AuthService {
           )
           .timeout(const Duration(seconds: 15));
 
-      print('[AuthService] REGISTER status: ${res.statusCode}');
-      print('[AuthService] REGISTER response: ${res.body}');
 
       final data = jsonDecode(res.body);
 
@@ -156,26 +354,117 @@ class AuthService {
       }
 
       final rawMessage = _extractMessage(data) ?? '';
-      print('[AuthService] REGISTER failed: $rawMessage');
       return {
         'success': false,
         'message': _friendlyRegisterError(res.statusCode, data),
       };
     } on SocketException catch (e) {
-      print('[AuthService] REGISTER SocketException: $e');
       return {
         'success': false,
         'message':
             'No internet connection. Please check your network and try again.',
       };
     } on HttpException catch (e) {
-      print('[AuthService] REGISTER HttpException: $e');
       return {
         'success': false,
         'message': 'Unable to reach the server. Please try again later.',
       };
     } catch (e) {
-      print('[AuthService] REGISTER error: $e');
+      return {
+        'success': false,
+        'message': 'Something went wrong. Please try again.',
+      };
+    }
+  }
+
+  // POST /api/v1/auth/password/reset — initiate a password reset by email.
+  static Future<Map<String, dynamic>> requestPasswordReset({
+    required String email,
+  }) async {
+    try {
+      final res = await http
+          .post(
+            Uri.parse('$_baseUrl/auth/password/reset'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'email': email}),
+          )
+          .timeout(const Duration(seconds: 15));
+
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        return {'success': true};
+      }
+
+      final data = jsonDecode(res.body);
+      final rawMessage = _extractMessage(data) ?? '';
+      return {
+        'success': false,
+        'message': rawMessage.isNotEmpty
+            ? rawMessage
+            : 'Failed to send reset instructions. Please try again.',
+      };
+    } on SocketException {
+      return {
+        'success': false,
+        'message':
+            'No internet connection. Please check your network and try again.',
+      };
+    } on HttpException {
+      return {
+        'success': false,
+        'message': 'Unable to reach the server. Please try again later.',
+      };
+    } catch (e) {
+      return {
+        'success': false,
+        'message': 'Something went wrong. Please try again.',
+      };
+    }
+  }
+
+  // POST /api/v1/auth/password/reset/confirm — confirm a password reset
+  // using the token sent to the user's email, and set a new password.
+  static Future<Map<String, dynamic>> confirmPasswordReset({
+    required String token,
+    required String password,
+    required String passwordConfirmation,
+  }) async {
+    try {
+      final res = await http
+          .post(
+            Uri.parse('$_baseUrl/auth/password/reset/confirm'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'token': token,
+              'password': password,
+              'password_confirmation': passwordConfirmation,
+            }),
+          )
+          .timeout(const Duration(seconds: 15));
+
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        return {'success': true};
+      }
+
+      final data = jsonDecode(res.body);
+      final rawMessage = _extractMessage(data) ?? '';
+      return {
+        'success': false,
+        'message': rawMessage.isNotEmpty
+            ? rawMessage
+            : 'Failed to reset password. The code may be invalid or expired.',
+      };
+    } on SocketException {
+      return {
+        'success': false,
+        'message':
+            'No internet connection. Please check your network and try again.',
+      };
+    } on HttpException {
+      return {
+        'success': false,
+        'message': 'Unable to reach the server. Please try again later.',
+      };
+    } catch (e) {
       return {
         'success': false,
         'message': 'Something went wrong. Please try again.',
@@ -225,7 +514,7 @@ class AuthService {
                     raw.toLowerCase().contains('already') ||
                     raw.toLowerCase().contains('taken') ||
                     raw.toLowerCase().contains('in use'))) {
-              messages.add('An account with this email already exists. Please log in.');
+              messages.add('That email address is already in use.');
             } else {
               messages.add(_friendlyFieldError(field, raw));
             }
@@ -254,10 +543,15 @@ class AuthService {
     final raw = rawError.toLowerCase();
     switch (field) {
       case 'email':
-        if (raw.contains('exist') || raw.contains('already') || raw.contains('taken') || raw.contains('in use')) {
+        if (raw.contains('exist') ||
+            raw.contains('already') ||
+            raw.contains('taken') ||
+            raw.contains('in use')) {
           return 'An account with this email already exists. Please log in.';
         }
-        if (raw.contains('valid') || raw.contains('format') || raw.contains('invalid')) {
+        if (raw.contains('valid') ||
+            raw.contains('format') ||
+            raw.contains('invalid')) {
           return 'Please enter a valid email address.';
         }
         return 'Please enter a valid email address.';
@@ -277,13 +571,12 @@ class AuthService {
   }
 
   static Future<void> _saveSession(Map<String, dynamic> data) async {
+    // Clear any pending login-redirect claim so auth failures after a fresh
+    // login can redirect again if needed.
+    _redirectingToLogin = false;
     final prefs = await SharedPreferences.getInstance();
 
-    print('[AuthService] _saveSession: Response keys: ${data.keys.toList()}');
     if (data['data'] is Map) {
-      print(
-        '[AuthService] _saveSession: data.data keys: ${(data['data'] as Map).keys.toList()}',
-      );
     }
 
     final payload = _asStringKeyedMap(data['data']);
@@ -293,38 +586,27 @@ class AuthService {
     final token = _extractToken(data);
     final refreshToken = _extractRefreshToken(data);
 
-    print('[AuthService] _saveSession: access token found: ${token != null && token.isNotEmpty}');
-    print('[AuthService] _saveSession: refresh token found: ${refreshToken != null && refreshToken.isNotEmpty}');
-    // Log all top-level keys and data keys to help diagnose missing refresh token
-    print('[AuthService] _saveSession: full data keys: ${data.keys.toList()}');
-    if (payload != null) print('[AuthService] _saveSession: payload keys: ${payload.keys.toList()}');
-    if (user != null) print('[AuthService] _saveSession: user keys: ${user.keys.toList()}');
-
     final role =
         _toString(user?['role']) ??
         _toString(payload?['role']) ??
         _toString(data['role']);
+    final email =
+        _extractEmail(data) ?? _extractEmail(payload) ?? _extractEmail(user);
 
-    print(
-      '[AuthService] _saveSession: Token length: ${token?.length ?? 0}, Role: ${role ?? 'null'}',
-    );
 
     if (token != null && token.isNotEmpty) {
       final trimmedToken = _normalizeToken(token);
       if (trimmedToken.isNotEmpty) {
         await prefs.setString('token', trimmedToken);
         _cachedToken = trimmedToken;
-        print('[AuthService] _saveSession: Token saved (${trimmedToken.length} chars)');
 
         final expiresAt = _extractTokenExpiry(trimmedToken);
         if (expiresAt != null) {
           await prefs.setInt(_tokenExpiryKey, expiresAt.millisecondsSinceEpoch);
           _cachedTokenExpiryMs = expiresAt.millisecondsSinceEpoch;
-          print('[AuthService] _saveSession: Token expiry saved at $expiresAt');
         } else {
           await prefs.remove(_tokenExpiryKey);
           _cachedTokenExpiryMs = null;
-          print('[AuthService] _saveSession: Token expiry not available');
         }
       } else {
         await prefs.remove('token');
@@ -335,26 +617,34 @@ class AuthService {
       await prefs.remove('token');
       _cachedToken = null;
       _cachedTokenExpiryMs = null;
-      print('[AuthService] _saveSession: No token found in response');
     }
 
     if (refreshToken != null && refreshToken.isNotEmpty) {
       final trimmedRefreshToken = _normalizeToken(refreshToken);
       if (trimmedRefreshToken.isNotEmpty) {
         await prefs.setString('refresh_token', trimmedRefreshToken);
-        print('[AuthService] _saveSession: Refresh token saved (${trimmedRefreshToken.length} chars)');
       }
     } else {
-      print('[AuthService] _saveSession: No refresh token in response — server may not issue one');
+      final existingRefresh = prefs.getString('refresh_token');
+      if (existingRefresh != null && existingRefresh.trim().isNotEmpty) {
+      } else {
+      }
     }
 
     if (role != null && role.isNotEmpty) {
       final normalizedRole = role.trim();
       await prefs.setString('role', normalizedRole);
-      await prefs.setString(_activeRoleKey, normalizedRole);
-      await prefs.setString(_lastAccountModeKey, normalizedRole);
-      print('[AuthService] _saveSession: Active role set to: $normalizedRole');
-      print('[AuthService] _saveSession: Role saved: $normalizedRole');
+      final normalizedEmail = _normalizeEmail(email);
+      if (normalizedEmail != null) {
+        await prefs.setString(_currentAccountEmailKey, normalizedEmail);
+        final lastModeKey = _lastAccountModeKeyForEmail(normalizedEmail);
+        await prefs.setString(lastModeKey, normalizedRole);
+      } else {
+        final existingLastMode = prefs.getString(_lastAccountModeKey);
+        if (existingLastMode == null || existingLastMode.trim().isEmpty) {
+          await prefs.setString(_lastAccountModeKey, normalizedRole);
+        }
+      }
     } else {
       await prefs.remove('role');
     }
@@ -372,9 +662,7 @@ class AuthService {
     if (profileSource != null) {
       try {
         await prefs.setString('profile', jsonEncode(profileSource));
-        print('[AuthService] Profile cache saved');
       } catch (e) {
-        print('[AuthService] Failed to cache profile: $e');
       }
     }
   }
@@ -525,19 +813,19 @@ class AuthService {
         if (value is String) {
           values.add(value);
         } else if (value is List) {
-          values.addAll(value
-              .map((item) => _toString(item))
-              .where((text) => text != null && text.isNotEmpty)
-              .cast<String>());
+          values.addAll(
+            value
+                .map((item) => _toString(item))
+                .where((text) => text != null && text.isNotEmpty)
+                .cast<String>(),
+          );
         } else if (value != null) {
           final text = _toString(value);
           if (text != null && text.isNotEmpty) values.add(text);
         }
         if (values.isNotEmpty) {
           final fieldName = entry.key.toString().replaceAll('_', ' ');
-          detailMessages.add(
-            '${fieldName[0].toUpperCase()}${fieldName.substring(1)}: ${values.join(', ')}',
-          );
+          detailMessages.add('$fieldName: ${values.join(', ')}.');
         }
       }
       if (detailMessages.isNotEmpty) {
@@ -560,8 +848,6 @@ class AuthService {
             .get(Uri.parse('$_baseUrl/jobs/$ulid'), headers: headers)
             .timeout(const Duration(seconds: 15)),
       );
-      print('[AuthService] GET JOB DETAILS status: ${res.statusCode}');
-      print('[AuthService] GET JOB DETAILS response: ${res.body}');
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body) as Map<String, dynamic>;
         final job =
@@ -572,7 +858,6 @@ class AuthService {
       }
       return {'success': false, 'message': 'Failed to load job details.'};
     } catch (e) {
-      print('[AuthService] GET JOB DETAILS error: $e');
       return {'success': false, 'message': 'Unable to load job details.'};
     }
   }
@@ -588,20 +873,31 @@ class AuthService {
   /// Updates local active role on success
   static Future<Map<String, dynamic>> switchRole(String newRole) async {
     try {
+      // Ensure we have a valid access token, attempt refresh if possible
       final token = await getToken();
+      final refreshToken = await _getRefreshToken();
+
       if (token == null || token.isEmpty) {
-        print('[AuthService] switchRole: No token available');
-        return {
-          'success': false,
-          'message': 'Authentication required. Please log in again.',
-        };
+        // Try to refresh using refresh token if available
+        if (refreshToken != null && refreshToken.isNotEmpty) {
+          final refreshed = await _refreshAccessToken();
+          if (!refreshed) {
+            return {
+              'success': false,
+              'message': 'Authentication required. Please log in again.',
+            };
+          }
+        } else {
+          return {
+            'success': false,
+            'message': 'Authentication required. Please log in again.',
+          };
+        }
       }
 
       final headers = await _getAuthHeaders();
       final requestBody = jsonEncode({'role': newRole});
 
-      print('[AuthService] SWITCH ROLE → $_baseUrl/auth/switch-role');
-      print('[AuthService] SWITCH ROLE body: $requestBody');
 
       final res = await _sendWithAuthRetry(
         (headers) => http
@@ -613,23 +909,21 @@ class AuthService {
             .timeout(const Duration(seconds: 15)),
       );
 
-      print('[AuthService] SWITCH ROLE status: ${res.statusCode}');
-      print('[AuthService] SWITCH ROLE response: ${res.body}');
 
       if (res.statusCode == 200 || res.statusCode == 201) {
         final data = jsonDecode(res.body);
-        
+
         // Update local active role
         await setActiveRole(newRole);
-        
+
         // Update profile cache if returned in response
         if (data['data'] is Map || data['user'] is Map) {
           await _saveSession(data);
         }
 
-        print('[AuthService] SWITCH ROLE: Successfully switched to $newRole');
         return {
           'success': true,
+          'statusCode': res.statusCode,
           'message': 'Role switched successfully',
           'role': newRole,
           'data': data,
@@ -637,10 +931,10 @@ class AuthService {
       }
 
       if (res.statusCode == 401) {
-        print('[AuthService] SWITCH ROLE: 401 Unauthorized - Clearing session');
         await _clearStoredSession();
         return {
           'success': false,
+          'statusCode': res.statusCode,
           'message': 'Authentication required. Please log in again.',
         };
       }
@@ -649,7 +943,9 @@ class AuthService {
       final msg = _extractMessage(data) ?? 'Failed to switch role.';
       return {
         'success': false,
+        'statusCode': res.statusCode,
         'message': msg,
+        'data': data,
       };
     } on SocketException {
       return {
@@ -657,7 +953,6 @@ class AuthService {
         'message': 'No internet connection. Please check your network.',
       };
     } catch (e) {
-      print('[AuthService] SWITCH ROLE error: $e');
       return {'success': false, 'message': 'Unable to switch role.'};
     }
   }
@@ -666,6 +961,33 @@ class AuthService {
   /// Returns the role the user is currently operating as
   static const String _activeRoleKey = 'active_role';
   static const String _lastAccountModeKey = 'last_account_mode';
+
+  static String _lastAccountModeKeyForEmail(String email) =>
+      '${_lastAccountModeKey}_${email.trim().toLowerCase()}';
+
+  static String? _normalizeEmail(String? email) {
+    final value = email?.trim().toLowerCase();
+    if (value == null || value.isEmpty) return null;
+    return value;
+  }
+
+  static String? _extractEmail(Map<String, dynamic>? data) {
+    if (data == null) return null;
+    final payload =
+        (data['data'] is Map ? data['data'] : null) as Map<String, dynamic>?;
+    final user =
+        (payload?['user'] is Map ? payload!['user'] : null)
+            as Map<String, dynamic>?;
+    return _toString(user?['email']) ??
+        _toString(payload?['email']) ??
+        _toString(data['email']) ??
+        _toString(data['user_email']);
+  }
+
+  static Future<String?> getCurrentAccountEmail() async {
+    final prefs = await SharedPreferences.getInstance();
+    return _normalizeEmail(prefs.getString(_currentAccountEmailKey));
+  }
 
   static Future<String?> getActiveRole() async {
     final prefs = await SharedPreferences.getInstance();
@@ -677,8 +999,18 @@ class AuthService {
     return activeRole.trim();
   }
 
-  static Future<String?> getLastAccountMode() async {
+  static Future<String?> getLastAccountMode({String? email}) async {
     final prefs = await SharedPreferences.getInstance();
+    final normalizedEmail = _normalizeEmail(email);
+    if (normalizedEmail != null) {
+      final scoped = prefs.getString(
+        _lastAccountModeKeyForEmail(normalizedEmail),
+      );
+      if (scoped != null && scoped.trim().isNotEmpty) {
+        return scoped.trim();
+      }
+    }
+
     final lastMode = prefs.getString(_lastAccountModeKey);
     if (lastMode == null || lastMode.trim().isEmpty) {
       return null;
@@ -686,14 +1018,31 @@ class AuthService {
     return lastMode.trim();
   }
 
+  /// Ensures the stored token is scoped to [role]. Calls switchRole if needed.
+  static Future<bool> ensureRole(String role) async {
+    final current = await getActiveRole();
+    if (current?.toLowerCase() == role.toLowerCase()) return true;
+    final result = await switchRole(role);
+    return result['success'] == true;
+  }
+
   /// Set the active role (used after successful role switch)
-  static Future<void> setActiveRole(String role) async {
+  static Future<void> setActiveRole(String role, {String? email}) async {
     final prefs = await SharedPreferences.getInstance();
     if (role.isNotEmpty) {
       final normalized = role.trim();
       await prefs.setString(_activeRoleKey, normalized);
-      await prefs.setString(_lastAccountModeKey, normalized);
-      print('[AuthService] setActiveRole: Active role set to $normalized');
+      final normalizedEmail =
+          _normalizeEmail(email) ?? await getCurrentAccountEmail();
+      if (normalizedEmail != null) {
+        await prefs.setString(_currentAccountEmailKey, normalizedEmail);
+        await prefs.setString(
+          _lastAccountModeKeyForEmail(normalizedEmail),
+          normalized,
+        );
+      } else {
+        await prefs.setString(_lastAccountModeKey, normalized);
+      }
     } else {
       await prefs.remove(_activeRoleKey);
     }
@@ -710,18 +1059,229 @@ class AuthService {
     return [];
   }
 
-  static Future<void> _clearStoredSession() async {
+  static const String _profileSetupCompleteKey = 'profile_setup_complete';
+
+  static Future<void> markProfileSetupComplete() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('token');
-    await prefs.remove('refresh_token');
-    await prefs.remove(_tokenExpiryKey);
-    await prefs.remove('role');
-    await prefs.remove('active_role');
-    await prefs.remove('profile');
-    await prefs.remove('user_lat');
-    await prefs.remove('user_lng');
-    _cachedToken = null;
-    _cachedTokenExpiryMs = null;
+    await prefs.setBool(_profileSetupCompleteKey, true);
+  }
+
+  static Future<bool> hasCompletedProfileSetup() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_profileSetupCompleteKey) == true;
+  }
+
+  static Future<void> _clearStoredSession() async {
+    // Prevent concurrent 401 handlers from each clearing and redirecting.
+    if (_sessionBeingCleared) return;
+    _sessionBeingCleared = true;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove('token');
+      await prefs.remove('refresh_token');
+      await prefs.remove(_tokenExpiryKey);
+      await prefs.remove('role');
+      await prefs.remove('active_role');
+      await prefs.remove('profile');
+      await prefs.remove(_currentAccountEmailKey);
+      await prefs.remove('user_lat');
+      await prefs.remove(_pendingInterruptedRouteKey);
+      await prefs.remove('user_lng');
+      await prefs.remove('pending_customer_job_draft');
+      await prefs.remove('pending_provider_setup');
+      _cachedToken = null;
+      _cachedTokenExpiryMs = null;
+    } finally {
+      _sessionBeingCleared = false;
+    }
+  }
+
+  // Expose whether a logout is in progress so callers can skip redundant
+  // navigation to the login screen.
+  static bool get isSessionBeingCleared => _sessionBeingCleared;
+
+  static Future<void> savePendingInterruptedRoute(
+    String route, {
+    String? reason,
+    Map<String, dynamic>? payload,
+    String? email,
+  }) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final normalizedEmail =
+          _normalizeEmail(email) ?? await getCurrentAccountEmail();
+      final data = <String, dynamic>{
+        'route': route,
+        if (reason != null && reason.isNotEmpty) 'reason': reason,
+        if (payload != null && payload.isNotEmpty) 'payload': payload,
+        if (normalizedEmail != null) 'account_email': normalizedEmail,
+        'saved_at': DateTime.now().toIso8601String(),
+      };
+      await prefs.setString(_pendingInterruptedRouteKey, jsonEncode(data));
+    } catch (e) {
+    }
+  }
+
+  static Future<Map<String, dynamic>?> getPendingInterruptedRoute({
+    String? email,
+  }) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final cached = prefs.getString(_pendingInterruptedRouteKey);
+      if (cached == null || cached.isEmpty) return null;
+
+      final data = jsonDecode(cached);
+      if (data is! Map<String, dynamic>) return null;
+
+      final storedEmail = _normalizeEmail(data['account_email']?.toString());
+      final normalizedEmail = _normalizeEmail(email);
+      if (storedEmail != null &&
+          normalizedEmail != null &&
+          storedEmail != normalizedEmail) {
+        return null;
+      }
+
+      return data;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  static Future<void> clearPendingInterruptedRoute() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_pendingInterruptedRouteKey);
+    } catch (e) {
+    }
+  }
+  // ── PENDING FORM STATE MANAGEMENT ──────────────────────────────────────
+
+  /// Cache provider setup form data to restore after re-login on auth failure
+  static Future<void> savePendingProviderSetup(
+    Map<String, dynamic> formData,
+  ) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final normalizedEmail = await getCurrentAccountEmail();
+      final payload = <String, dynamic>{
+        'account_email': normalizedEmail,
+        'payload': formData,
+      };
+      await prefs.setString('pending_provider_setup', jsonEncode(payload));
+      await savePendingInterruptedRoute(
+        '/provider-setup',
+        reason: 'provider_setup',
+        payload: formData,
+        email: normalizedEmail,
+      );
+    } catch (e) {
+    }
+  }
+
+  /// Retrieve cached provider setup form data (e.g., after re-login)
+  static Future<Map<String, dynamic>?> getPendingProviderSetup({
+    String? email,
+  }) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final cached = prefs.getString('pending_provider_setup');
+      if (cached != null) {
+        final data = jsonDecode(cached);
+        if (data is Map<String, dynamic>) {
+          final storedEmail = _normalizeEmail(
+            data['account_email']?.toString(),
+          );
+          final normalizedEmail = _normalizeEmail(email);
+          if (storedEmail != null &&
+              normalizedEmail != null &&
+              storedEmail != normalizedEmail) {
+            return null;
+          }
+
+          final payload = data['payload'];
+          if (payload is Map<String, dynamic>) {
+            return payload;
+          }
+          return data;
+        }
+      }
+    } catch (e) {
+    }
+    return null;
+  }
+
+  /// Clear cached provider setup form data (after successful submission)
+  static Future<void> clearPendingProviderSetup() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove('pending_provider_setup');
+      await clearPendingInterruptedRoute();
+    } catch (e) {
+    }
+  }
+
+  static const String _pendingCustomerJobDraftKey =
+      'pending_customer_job_draft';
+
+  static Future<void> savePendingCustomerJobDraft(
+    Map<String, dynamic> draft,
+  ) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final normalizedEmail = await getCurrentAccountEmail();
+      final payload = <String, dynamic>{
+        'account_email': normalizedEmail,
+        'draft': draft,
+      };
+      await prefs.setString(_pendingCustomerJobDraftKey, jsonEncode(payload));
+      await savePendingInterruptedRoute(
+        '/customer-dashboard',
+        reason: 'customer_job_draft',
+        payload: draft,
+        email: normalizedEmail,
+      );
+    } catch (e) {
+    }
+  }
+
+  static Future<Map<String, dynamic>?> getPendingCustomerJobDraft({
+    String? email,
+  }) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final cached = prefs.getString(_pendingCustomerJobDraftKey);
+      if (cached != null && cached.isNotEmpty) {
+        final data = jsonDecode(cached);
+        if (data is Map<String, dynamic>) {
+          final storedEmail = _normalizeEmail(
+            data['account_email']?.toString(),
+          );
+          final normalizedEmail = _normalizeEmail(email);
+          if (storedEmail != null &&
+              normalizedEmail != null &&
+              storedEmail != normalizedEmail) {
+            return null;
+          }
+
+          final draft = data['draft'];
+          if (draft is Map<String, dynamic>) {
+            return draft;
+          }
+          return data;
+        }
+      }
+    } catch (e) {
+    }
+    return null;
+  }
+
+  static Future<void> clearPendingCustomerJobDraft() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_pendingCustomerJobDraftKey);
+      await clearPendingInterruptedRoute();
+    } catch (e) {
+    }
   }
 
   static Future<Map<String, dynamic>?> getCachedProfile() async {
@@ -754,7 +1314,6 @@ class AuthService {
       }
 
       if (token == null || token.isEmpty) {
-        print('[AuthService] getProfile: No token available');
         return {
           'success': false,
           'auth_required': true,
@@ -767,16 +1326,14 @@ class AuthService {
             .get(Uri.parse('$_baseUrl/me'), headers: headers)
             .timeout(const Duration(seconds: 15)),
       );
-      print('[AuthService] GET PROFILE status: ${res.statusCode}');
-      print('[AuthService] GET PROFILE response: ${res.body}');
       if (res.statusCode == 200) {
         final decoded = jsonDecode(res.body) as Map<String, dynamic>;
         Map<String, dynamic> savedProfile = decoded;
         if (prefs.getString('profile') != null) {
           try {
-            final cached = jsonDecode(prefs.getString('profile')!) as Map<String, dynamic>;
+            final cached =
+                jsonDecode(prefs.getString('profile')!) as Map<String, dynamic>;
             savedProfile = _mergeProfileCache(cached, decoded, {});
-            print('[AuthService] Profile cache merged with /me response');
           } catch (_) {
             savedProfile = decoded;
           }
@@ -791,13 +1348,9 @@ class AuthService {
           extractedUser.addAll(mapped);
         }
         await prefs.setString('profile', jsonEncode(savedProfile));
-        print(
-          '[AuthService] Profile cache updated with /me response: $savedProfile',
-        );
         return {'success': true, 'data': savedProfile};
       }
       if (res.statusCode == 401) {
-        await _clearStoredSession();
         return {
           'success': false,
           'auth_required': true,
@@ -810,8 +1363,96 @@ class AuthService {
         'message': _extractMessage(data) ?? 'Failed to load profile.',
       };
     } catch (e) {
-      print('[AuthService] GET PROFILE error: $e');
       return {'success': false, 'message': 'Unable to load profile.'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> getProviderAccountProfile({
+    bool forceRefresh = false,
+  }) async {
+    const cacheKey = 'provider_account_profile';
+    try {
+      if (!forceRefresh) {
+        final cached = await _readCache(cacheKey);
+        if (cached is Map<String, dynamic>) {
+          final normalized = Map<String, dynamic>.from(cached);
+          normalized.addAll(_mapApiResponseToUi(_extractProfileSource(cached)));
+          return {'success': true, 'data': normalized, 'fromCache': true};
+        }
+      }
+
+      final token = await getToken();
+      if (token == null || token.isEmpty) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      final res = await _sendWithAuthRetry(
+        (headers) => http
+            .get(Uri.parse('$_baseUrl/provider/profile'), headers: headers)
+            .timeout(const Duration(seconds: 15)),
+      );
+
+
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final Map<String, dynamic> raw =
+            (data['data'] is Map<String, dynamic>
+                ? data['data'] as Map<String, dynamic>
+                : null) ??
+            (data['provider'] is Map<String, dynamic>
+                ? data['provider'] as Map<String, dynamic>
+                : null) ??
+            (data is Map<String, dynamic> ? data : {});
+
+        final normalized = Map<String, dynamic>.from(raw);
+        normalized.addAll(_mapApiResponseToUi(raw));
+        await _saveCache(cacheKey, normalized);
+        return {'success': true, 'data': normalized};
+      }
+
+      if (res.statusCode == 401) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      if (res.statusCode == 404) {
+        return {
+          'success': false,
+          'statusCode': 404,
+          'message': 'Provider profile not found.',
+        };
+      }
+
+      final data = jsonDecode(res.body);
+      return {
+        'success': false,
+        'message':
+            _extractMessage(data) ?? 'Failed to load provider account profile.',
+      };
+    } on SocketException {
+      final cached = await _readCache(cacheKey);
+      if (cached is Map<String, dynamic>) {
+        return {'success': true, 'data': cached, 'fromCache': true};
+      }
+      return {'success': false, 'message': 'No internet connection.'};
+    } catch (e) {
+      final cached = await _readCache(cacheKey);
+      if (cached is Map<String, dynamic>) {
+        final normalized = Map<String, dynamic>.from(cached);
+        normalized.addAll(_mapApiResponseToUi(_extractProfileSource(cached)));
+        return {'success': true, 'data': normalized, 'fromCache': true};
+      }
+      return {
+        'success': false,
+        'message': 'Unable to load provider account profile.',
+      };
     }
   }
 
@@ -834,9 +1475,7 @@ class AuthService {
         }),
       );
       await prefs.setInt(cacheTs, DateTime.now().millisecondsSinceEpoch);
-      print('[AuthService] Cached provider images for $ulid');
     } catch (e) {
-      print('[AuthService] Error caching provider images: $e');
     }
   }
 
@@ -849,9 +1488,54 @@ class AuthService {
         return jsonDecode(cached) as Map<String, dynamic>;
       }
     } catch (e) {
-      print('[AuthService] Error reading provider images: $e');
     }
     return null;
+  }
+
+  static bool hasProviderAccountProfileData(Map<String, dynamic>? profile) {
+    if (profile == null || profile.isEmpty) return false;
+
+    final source = _extractProfileSource(profile);
+    final candidateFields = [
+      'business_name',
+      'provider_name',
+      'company_name',
+      'name',
+      'display_name',
+      'full_name',
+      'profile_name',
+      'profile_display_name',
+    ];
+
+    for (final field in candidateFields) {
+      final value = source[field] ?? profile[field];
+      if (value != null && value.toString().trim().isNotEmpty) {
+        return true;
+      }
+    }
+
+    final bio = (source['bio'] ?? source['description'] ?? source['about'])
+        ?.toString()
+        .trim();
+    if (bio?.isNotEmpty == true) return true;
+
+    final services =
+        source['services'] ??
+        source['service_categories'] ??
+        source['category_slugs'] ??
+        source['categories'];
+    if (services is List && services.isNotEmpty) return true;
+
+    final location =
+        (source['location'] ??
+                source['address'] ??
+                source['workshop_address'] ??
+                source['workshop_location'])
+            ?.toString()
+            .trim();
+    if (location?.isNotEmpty == true) return true;
+
+    return false;
   }
 
   static Future<void> saveProvidersList(
@@ -866,11 +1550,7 @@ class AuthService {
           'cached_at': DateTime.now().millisecondsSinceEpoch,
         }),
       );
-      print(
-        '[AuthService] Cached ${providers.length} provider records with images',
-      );
     } catch (e) {
-      print('[AuthService] Error caching providers list: $e');
     }
   }
 
@@ -886,7 +1566,6 @@ class AuthService {
         }
       }
     } catch (e) {
-      print('[AuthService] Error reading providers list: $e');
     }
     return null;
   }
@@ -959,44 +1638,43 @@ class AuthService {
         }
       }
 
-      final token = await getToken();
-      print(
-        '[AuthService] GET CUSTOMER JOBS token: ${token != null ? 'present (${token.length} chars)' : 'null'}',
-      );
-
-      final res = await _sendWithAuthRetry(
+      Future<http.Response> makeRequest() => _sendWithAuthRetry(
         (headers) => http
-            .get(Uri.parse('$_baseUrl/customer/jobs'), headers: headers)
+            .get(
+              Uri.parse('$_baseUrl/customer/jobs').replace(
+                queryParameters: {'per_page': '50'},
+              ),
+              headers: headers,
+            )
             .timeout(const Duration(seconds: 15)),
       );
 
-      print('[AuthService] GET CUSTOMER JOBS status: ${res.statusCode}');
-      print('[AuthService] GET CUSTOMER JOBS response: ${res.body}');
+      var res = await makeRequest();
+
+      // Token may be provider-scoped — switch to customer and retry once on 403
+      if (res.statusCode == 403) {
+        final switched = await switchRole('customer');
+        if (switched['success'] == true) {
+          res = await makeRequest();
+        }
+      }
+
 
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
-        print('[AuthService] GET CUSTOMER JOBS decoded keys: ${data is Map ? (data as Map).keys.toList() : "is List"}');
         final List<dynamic> raw =
             (data is List ? data : null) ??
             (data['data'] is List ? data['data'] : null) ??
             (data['jobs'] is List ? data['jobs'] : null) ??
             [];
-        print('[AuthService] GET CUSTOMER JOBS extracted ${raw.length} items');
-        if (raw.isNotEmpty) {
-          print('[AuthService] GET CUSTOMER JOBS first item keys: ${(raw.first as Map).keys.toList()}');
-          print('[AuthService] GET CUSTOMER JOBS first item status: ${(raw.first as Map)["status"]}');
-        }
         await _saveCache(cacheKey, raw);
         return {'success': true, 'data': raw};
       }
 
       if (res.statusCode == 401) {
-        print(
-          '[AuthService] GET CUSTOMER JOBS: 401 Unauthorized - Token cleared',
-        );
-        await _clearStoredSession();
         return {
           'success': false,
+          'auth_required': true,
           'message': 'Authentication required. Please log in again.',
         };
       }
@@ -1012,9 +1690,146 @@ class AuthService {
         'message': 'No internet connection. Please check your network.',
       };
     } catch (e) {
-      print('[AuthService] GET CUSTOMER JOBS error: $e');
       return {'success': false, 'message': 'Unable to load jobs.'};
     }
+  }
+
+  static Future<Map<String, dynamic>> getCustomerSavedProviders({
+    bool forceRefresh = false,
+  }) async {
+    const cacheKey = 'customer_saved_providers';
+    try {
+      if (!forceRefresh) {
+        final cached = await _readCache(cacheKey);
+        if (cached is List) {
+          return {'success': true, 'data': cached, 'fromCache': true};
+        }
+      }
+
+      Future<http.Response> makeRequest() => _sendWithAuthRetry(
+        (headers) => http
+            .get(
+              Uri.parse('$_baseUrl/customer/saved-providers'),
+              headers: headers,
+            )
+            .timeout(const Duration(seconds: 15)),
+      );
+
+      var res = await makeRequest();
+
+      if (res.statusCode == 403) {
+        final switched = await switchRole('customer');
+        if (switched['success'] == true) {
+          res = await makeRequest();
+        }
+      }
+
+
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final List<dynamic> raw =
+            (data is List ? data : null) ??
+            (data['data'] is List ? data['data'] : null) ??
+            (data['providers'] is List ? data['providers'] : null) ??
+            [];
+        await _saveCache(cacheKey, raw);
+        return {'success': true, 'data': raw};
+      }
+
+      if (res.statusCode == 401) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      final data = jsonDecode(res.body);
+      return {
+        'success': false,
+        'message': _extractMessage(data) ?? 'Failed to load saved providers.',
+      };
+    } on SocketException {
+      return {
+        'success': false,
+        'message': 'No internet connection. Please check your network.',
+      };
+    } catch (e) {
+      return {'success': false, 'message': 'Unable to load saved providers.'};
+    }
+  }
+
+  /// Save a provider. POST /customer/saved-providers/{ulid}
+  static Future<Map<String, dynamic>> saveProvider(String ulid) async {
+    try {
+      await switchRole('customer');
+      final res = await _sendWithAuthRetry(
+        (headers) => http
+            .post(
+              Uri.parse('$_baseUrl/customer/saved-providers/$ulid'),
+              headers: headers,
+            )
+            .timeout(const Duration(seconds: 20)),
+      );
+
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        await _clearCache('customer_saved_providers');
+        savedProvidersVersion.value++;
+        return {'success': true, 'saved': true};
+      }
+      if (res.statusCode == 401) return {'success': false, 'auth_required': true};
+      final data = jsonDecode(res.body);
+      return {'success': false, 'message': _extractMessage(data) ?? 'Failed to save provider.'};
+    } on SocketException {
+      return {'success': false, 'message': 'No internet connection.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Request timed out. Please try again.'};
+    }
+  }
+
+  /// Unsave / delete a provider. DELETE /customer/saved-providers/{ulid}
+  static Future<Map<String, dynamic>> unsaveProvider(String ulid) async {
+    try {
+      await switchRole('customer');
+      final res = await _sendWithAuthRetry(
+        (headers) => http
+            .delete(
+              Uri.parse('$_baseUrl/customer/saved-providers/$ulid'),
+              headers: headers,
+            )
+            .timeout(const Duration(seconds: 20)),
+      );
+
+      if (res.statusCode == 200 || res.statusCode == 204) {
+        await _clearCache('customer_saved_providers');
+        savedProvidersVersion.value++;
+        return {'success': true, 'saved': false};
+      }
+      if (res.statusCode == 401) return {'success': false, 'auth_required': true};
+      if (res.statusCode == 404) return {'success': false, 'message': 'Provider was not in your saved list.'};
+      final data = jsonDecode(res.body);
+      return {'success': false, 'message': _extractMessage(data) ?? 'Failed to unsave provider.'};
+    } on SocketException {
+      return {'success': false, 'message': 'No internet connection.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Request timed out. Please try again.'};
+    }
+  }
+
+  // Legacy alias — callers that don't know the current state should migrate
+  // to explicit saveProvider / unsaveProvider calls.
+  static Future<Map<String, dynamic>> toggleSaveProvider(String ulid) =>
+      saveProvider(ulid);
+
+  static Future<bool> isProviderSaved(String ulid) async {
+    if (ulid.isEmpty) return false;
+    final cached = await _readCache('customer_saved_providers');
+    if (cached is! List) return false;
+    return cached.any((item) {
+      if (item is! Map) return false;
+      final p = item['provider'] is Map ? item['provider'] as Map : item;
+      return (p['ulid'] ?? p['id'] ?? '').toString() == ulid;
+    });
   }
 
   static Future<void> saveCustomerJob(Map<String, dynamic> jobData) async {
@@ -1071,8 +1886,6 @@ class AuthService {
             .timeout(const Duration(seconds: 15)),
       );
 
-      print('[AuthService] GET JOBS status: ${res.statusCode}');
-      print('[AuthService] GET JOBS response: ${res.body}');
 
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
@@ -1086,9 +1899,9 @@ class AuthService {
       }
 
       if (res.statusCode == 401) {
-        await _clearStoredSession();
         return {
           'success': false,
+          'auth_required': true,
           'message': 'Authentication required. Please log in again.',
         };
       }
@@ -1104,7 +1917,6 @@ class AuthService {
         'message': 'No internet connection. Please check your network.',
       };
     } catch (e) {
-      print('[AuthService] GET JOBS error: $e');
       return {'success': false, 'message': 'Unable to load jobs.'};
     }
   }
@@ -1128,8 +1940,6 @@ class AuthService {
             .timeout(const Duration(seconds: 15)),
       );
 
-      print('[AuthService] GET PROVIDER JOBS status: ${res.statusCode}');
-      print('[AuthService] GET PROVIDER JOBS response: ${res.body}');
 
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
@@ -1143,9 +1953,9 @@ class AuthService {
       }
 
       if (res.statusCode == 401) {
-        await _clearStoredSession();
         return {
           'success': false,
+          'auth_required': true,
           'message': 'Authentication required. Please log in again.',
         };
       }
@@ -1161,7 +1971,6 @@ class AuthService {
         'message': 'No internet connection. Please check your network.',
       };
     } catch (e) {
-      print('[AuthService] GET PROVIDER JOBS error: $e');
       return {'success': false, 'message': 'Unable to load provider jobs.'};
     }
   }
@@ -1173,8 +1982,8 @@ class AuthService {
       final value = raw is String
           ? raw.trim()
           : raw is num
-              ? raw.toString()
-              : raw?.toString().trim() ?? '';
+          ? raw.toString()
+          : raw?.toString().trim() ?? '';
       if (value.isNotEmpty) return value;
     }
     return '';
@@ -1186,7 +1995,6 @@ class AuthService {
     try {
       final token = await getToken();
       if (token == null || token.isEmpty) {
-        print('[AuthService] updateProfile: No token available');
         return {
           'success': false,
           'message': 'Authentication required. Please log in again.',
@@ -1197,25 +2005,21 @@ class AuthService {
       final apiFields = _mapProfileFieldsToApi(fields);
 
       final bool useMultipart = _containsLocalImages(fields);
-      final http.Response res = useMultipart
-          ? await _sendMultipartProfileUpdate(apiFields)
-          : await _sendWithAuthRetry(
-              (headers) => http
-                  .patch(
-                    Uri.parse('$_baseUrl/provider/profile'),
-                    headers: headers,
-                    body: jsonEncode(apiFields),
-                  )
-                  .timeout(const Duration(seconds: 15)),
-            );
+      Future<http.Response> sendRequest(String method) => useMultipart
+          ? _sendMultipartProfileUpdate(apiFields, method: method)
+          : _sendProviderProfileRequest(apiFields, method: method);
 
-      print('[AuthService] UPDATE PROFILE status: ${res.statusCode}');
-      print('[AuthService] UPDATE PROFILE response: ${res.body}');
+      var res = await sendRequest('PATCH');
+      if (res.statusCode == 404) {
+        res = await sendRequest('POST');
+      }
+
       if (res.statusCode == 200 || res.statusCode == 201) {
         final prefs = await SharedPreferences.getInstance();
         final cached = prefs.getString('profile');
-        final Map<String, dynamic> localCache =
-            cached != null ? jsonDecode(cached) as Map<String, dynamic> : {};
+        final Map<String, dynamic> localCache = cached != null
+            ? jsonDecode(cached) as Map<String, dynamic>
+            : {};
 
         Map<String, dynamic> updatedCache;
         try {
@@ -1234,15 +2038,13 @@ class AuthService {
         }
 
         await prefs.setString('profile', jsonEncode(updatedCache));
-        print('[AuthService] Profile cache updated: ${jsonEncode(updatedCache)}');
         return {'success': true};
       }
 
       if (res.statusCode == 401) {
-        print('[AuthService] UPDATE PROFILE: 401 Unauthorized - Token cleared');
-        await _clearStoredSession();
         return {
           'success': false,
+          'auth_required': true,
           'message': 'Authentication required. Please log in again.',
         };
       }
@@ -1253,7 +2055,6 @@ class AuthService {
         'message': _extractMessage(data) ?? 'Failed to update profile.',
       };
     } catch (e) {
-      print('[AuthService] UPDATE PROFILE error: $e');
       return {'success': false, 'message': 'Unable to update profile.'};
     }
   }
@@ -1271,12 +2072,10 @@ class AuthService {
         await prefs.setString('token', normalized);
       }
       _cachedToken = normalized;
-      print('[AuthService] getToken: returning stored token');
       return normalized;
     } else if (token != null) {
       // Remove empty token
       await prefs.remove('token');
-      print('[AuthService] getToken: removed empty token');
     }
 
     final cachedProfile = prefs.getString('profile');
@@ -1285,7 +2084,6 @@ class AuthService {
         final profile = jsonDecode(cachedProfile) as Map<String, dynamic>;
         final candidate = _extractToken(profile);
         if (candidate != null && candidate.trim().isNotEmpty) {
-          print('[AuthService] getToken: returning token from cached profile');
           final normalized = _normalizeToken(candidate);
           await prefs.setString('token', normalized);
           _cachedToken = normalized;
@@ -1296,7 +2094,6 @@ class AuthService {
       }
     }
 
-    print('[AuthService] getToken: no token found');
     return null;
   }
 
@@ -1311,7 +2108,9 @@ class AuthService {
 
   // ── HELPER METHODS ──────────────────────────────────────────
   /// Creates proper authorization headers with token validation and logging
-  static Future<bool> _isAccessTokenExpired({Duration buffer = const Duration(seconds: 30)}) async {
+  static Future<bool> _isAccessTokenExpired({
+    Duration buffer = const Duration(seconds: 30),
+  }) async {
     final prefs = await SharedPreferences.getInstance();
     final expiryMs = _cachedTokenExpiryMs ?? prefs.getInt(_tokenExpiryKey);
     if (expiryMs == null) {
@@ -1323,7 +2122,9 @@ class AuthService {
       await prefs.setInt(_tokenExpiryKey, _cachedTokenExpiryMs!);
       return DateTime.now().isAfter(expiresAt.subtract(buffer));
     }
-    return DateTime.now().isAfter(DateTime.fromMillisecondsSinceEpoch(expiryMs).subtract(buffer));
+    return DateTime.now().isAfter(
+      DateTime.fromMillisecondsSinceEpoch(expiryMs).subtract(buffer),
+    );
   }
 
   static DateTime? _extractTokenExpiry(String token) {
@@ -1349,7 +2150,10 @@ class AuthService {
             ? int.tryParse(expValue)
             : (expValue is num ? expValue.toInt() : null);
         if (epochSeconds == null) return null;
-        return DateTime.fromMillisecondsSinceEpoch(epochSeconds * 1000, isUtc: true);
+        return DateTime.fromMillisecondsSinceEpoch(
+          epochSeconds * 1000,
+          isUtc: true,
+        );
       }
     } catch (_) {
       // ignore invalid token format
@@ -1361,13 +2165,11 @@ class AuthService {
     final token = await getToken();
 
     if (token == null || token.isEmpty) {
-      print('[AuthService] _getAuthHeaders: No token available!');
       return {'Content-Type': 'application/json'};
     }
 
     final trimmedToken = _normalizeToken(token);
     if (trimmedToken.isEmpty) {
-      print('[AuthService] _getAuthHeaders: Token is empty after trim!');
       return {'Content-Type': 'application/json'};
     }
 
@@ -1379,9 +2181,6 @@ class AuthService {
     };
 
     // Log token info for debugging (length only, not actual token)
-    print(
-      '[AuthService] _getAuthHeaders: Token present (${trimmedToken.length} chars) - Authorization header set',
-    );
 
     return headers;
   }
@@ -1392,7 +2191,7 @@ class AuthService {
     final accessToken = await getToken();
 
     if (refreshToken == null || refreshToken.trim().isEmpty) {
-      print('[AuthService] REFRESH TOKEN: no refresh token available to refresh');
+      final stored = prefs.getString('refresh_token');
       return false;
     }
 
@@ -1435,9 +2234,6 @@ class AuthService {
             'Authorization': 'Bearer $bearer',
         };
 
-        print(
-          '[AuthService] REFRESH TOKEN → $_baseUrl/auth/refresh (${attempt['label']})',
-        );
         final res = await http
             .post(
               Uri.parse('$_baseUrl/auth/refresh'),
@@ -1446,8 +2242,6 @@ class AuthService {
             )
             .timeout(const Duration(seconds: 15));
 
-        print('[AuthService] REFRESH TOKEN status: ${res.statusCode}');
-        print('[AuthService] REFRESH TOKEN response: ${res.body}');
 
         if (res.statusCode == 200 || res.statusCode == 201) {
           final data = jsonDecode(res.body) as Map<String, dynamic>;
@@ -1462,7 +2256,10 @@ class AuthService {
 
           final expiresAt = _extractTokenExpiry(normalizedToken);
           if (expiresAt != null) {
-            await prefs.setInt(_tokenExpiryKey, expiresAt.millisecondsSinceEpoch);
+            await prefs.setInt(
+              _tokenExpiryKey,
+              expiresAt.millisecondsSinceEpoch,
+            );
             _cachedTokenExpiryMs = expiresAt.millisecondsSinceEpoch;
           } else {
             await prefs.remove(_tokenExpiryKey);
@@ -1480,7 +2277,6 @@ class AuthService {
         }
       }
     } catch (e) {
-      print('[AuthService] REFRESH TOKEN error: $e');
     }
 
     return false;
@@ -1518,9 +2314,12 @@ class AuthService {
   static Future<http.Response> _sendWithAuthRetry(
     Future<http.Response> Function(Map<String, String> headers) send,
   ) async {
+    // Check if token is near expiry and attempt refresh IF we have a refresh token
     if (await _isAccessTokenExpired()) {
-      print('[AuthService] Access token expired or near expiry; refreshing before request');
-      await _refreshAccessToken();
+      final refreshToken = await _getRefreshToken();
+      if (refreshToken != null && refreshToken.trim().isNotEmpty) {
+        await _refreshAccessToken();
+      }
     }
 
     var headers = await _getAuthHeaders();
@@ -1528,15 +2327,20 @@ class AuthService {
 
     if (res.statusCode != 401) return res;
 
-    print('[AuthService] Request returned 401; attempting token refresh');
-    final refreshed = await _refreshAccessToken();
-    if (!refreshed) {
-      print('[AuthService] Token refresh failed — clearing session');
-      await _clearStoredSession();
+    // On 401, attempt a token refresh if we have a refresh token.
+    // Do NOT call _clearStoredSession() here — a transient 401 from a silent
+    // background refresh must not destroy the session. Callers that handle
+    // auth_required: true are responsible for clearing and redirecting.
+    final refreshToken = await _getRefreshToken();
+    if (refreshToken == null || refreshToken.trim().isEmpty) {
       return res;
     }
 
-    print('[AuthService] Token refresh succeeded; retrying request');
+    final refreshed = await _refreshAccessToken();
+    if (!refreshed) {
+      return res;
+    }
+
     headers = await _getAuthHeaders();
     return send(headers);
   }
@@ -1544,9 +2348,12 @@ class AuthService {
   static Future<http.Response> _sendStreamedWithAuthRetry(
     Future<http.StreamedResponse> Function(Map<String, String> headers) send,
   ) async {
+    // Check if token is near expiry and attempt refresh IF we have a refresh token
     if (await _isAccessTokenExpired()) {
-      print('[AuthService] Access token expired or near expiry; refreshing before streamed request');
-      await _refreshAccessToken();
+      final refreshToken = await _getRefreshToken();
+      if (refreshToken != null && refreshToken.trim().isNotEmpty) {
+        await _refreshAccessToken();
+      }
     }
 
     var headers = await _getAuthHeaders();
@@ -1555,15 +2362,18 @@ class AuthService {
 
     if (res.statusCode != 401) return res;
 
-    print('[AuthService] Streamed request returned 401; attempting token refresh');
-    final refreshed = await _refreshAccessToken();
-    if (!refreshed) {
-      print('[AuthService] Token refresh failed — clearing session');
-      await _clearStoredSession();
+    // On 401, attempt refresh. Do NOT clear the session here — same reason
+    // as in _sendWithAuthRetry; callers own the clear + redirect decision.
+    final refreshToken = await _getRefreshToken();
+    if (refreshToken == null || refreshToken.trim().isEmpty) {
       return res;
     }
 
-    print('[AuthService] Token refresh succeeded; retrying streamed request');
+    final refreshed = await _refreshAccessToken();
+    if (!refreshed) {
+      return res;
+    }
+
     headers = await _getAuthHeaders();
     streamed = await send(headers);
     return await http.Response.fromStream(streamed);
@@ -1646,7 +2456,7 @@ class AuthService {
         'sunday': 7,
       };
       final availMap = <int, List<String>>{};
-      
+
       availJson.forEach((dayName, ranges) {
         if (dayNames.containsKey(dayName) && ranges is List) {
           final dayIdx = dayNames[dayName]!;
@@ -1677,6 +2487,9 @@ class AuthService {
     if (uiFields['bio'] != null) {
       api['bio'] = uiFields['bio'];
     }
+    if (uiFields['description'] != null) {
+      api['bio'] = uiFields['description'];
+    }
 
     // Map avatar to profile_photo_url
     if (uiFields['avatar'] != null) {
@@ -1687,10 +2500,30 @@ class AuthService {
     if (uiFields['services'] is List) {
       api['category_slugs'] = uiFields['services'];
     }
+    if (uiFields['service_categories'] is List) {
+      api['category_slugs'] = uiFields['service_categories'];
+    }
 
     // Map location to workshop_address
     if (uiFields['location'] != null) {
       api['workshop_address'] = uiFields['location'];
+    }
+
+    // Map user-facing name fields
+    if (uiFields['name'] != null) {
+      api['name'] = uiFields['name'];
+    }
+    if (uiFields['first_name'] != null) {
+      api['first_name'] = uiFields['first_name'];
+    }
+    if (uiFields['last_name'] != null) {
+      api['last_name'] = uiFields['last_name'];
+    }
+    if (uiFields['landmark'] != null) {
+      api['landmark'] = uiFields['landmark'];
+    }
+    if (uiFields['workshop_location'] != null) {
+      api['workshop_location'] = uiFields['workshop_location'];
     }
 
     // Map hourly_rate to hourly_rate_kobo (convert to kobo if needed)
@@ -1715,12 +2548,24 @@ class AuthService {
     if (uiFields['availability'] is Map) {
       final availMap = uiFields['availability'] as Map;
       final availJson = <String, List<String>>{};
-      final dayNames = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
-      
+      final dayNames = [
+        'monday',
+        'tuesday',
+        'wednesday',
+        'thursday',
+        'friday',
+        'saturday',
+        'sunday',
+      ];
+
       for (final entry in availMap.entries) {
         final dayIdx = entry.key as int?;
         final ranges = entry.value as List?;
-        if (dayIdx != null && dayIdx >= 1 && dayIdx <= 7 && ranges != null && ranges.isNotEmpty) {
+        if (dayIdx != null &&
+            dayIdx >= 1 &&
+            dayIdx <= 7 &&
+            ranges != null &&
+            ranges.isNotEmpty) {
           final dayName = dayNames[dayIdx - 1];
           availJson[dayName] = ranges.map((r) => r.toString()).toList();
         }
@@ -1739,7 +2584,14 @@ class AuthService {
   static bool _isLocalImagePath(String? path) {
     if (path == null || path.trim().isEmpty) return false;
     final trimmed = path.trim();
-    if (trimmed.toLowerCase().startsWith('http')) return false;
+    final lower = trimmed.toLowerCase();
+    if (lower.startsWith('http')) return false;
+    if (lower.startsWith('file://') || lower.startsWith('content://'))
+      return true;
+    if (trimmed.startsWith('/') ||
+        RegExp(r'^[a-zA-Z]:[\\/]').hasMatch(trimmed)) {
+      return true;
+    }
     return File(trimmed).existsSync();
   }
 
@@ -1757,18 +2609,37 @@ class AuthService {
   }
 
   static Future<http.Response> _sendMultipartProfileUpdate(
-    Map<String, dynamic> fields,
-  ) async {
+    Map<String, dynamic> fields, {
+    String method = 'PATCH',
+  }) async {
     return _sendStreamedWithAuthRetry((headers) async {
-      final request = http.MultipartRequest('PATCH', Uri.parse('$_baseUrl/provider/profile'));
+      final request = http.MultipartRequest(
+        method,
+        Uri.parse('$_baseUrl/provider/profile'),
+      );
       request.headers.addAll(headers);
+
+      final missingPaths = <String>[];
 
       for (final entry in fields.entries) {
         final key = entry.key;
         final value = entry.value;
 
-        if (key == 'profile_photo_url' && value is String && _isLocalImagePath(value)) {
-          request.files.add(await http.MultipartFile.fromPath('profile_photo_url', value));
+        if (key == 'profile_photo_url' &&
+            value is String &&
+            _isLocalImagePath(value)) {
+          try {
+            final path = value.toString();
+            if (File(path).existsSync()) {
+              request.files.add(
+                await http.MultipartFile.fromPath('profile_photo_url', path),
+              );
+            } else {
+              missingPaths.add(path);
+            }
+          } catch (e) {
+            missingPaths.add(value.toString());
+          }
           continue;
         }
 
@@ -1777,7 +2648,17 @@ class AuthService {
           for (final photo in value) {
             final path = photo?.toString() ?? '';
             if (_isLocalImagePath(path)) {
-              request.files.add(await http.MultipartFile.fromPath('gallery_photos[]', path));
+              try {
+                if (File(path).existsSync()) {
+                  request.files.add(
+                    await http.MultipartFile.fromPath('gallery_photos[]', path),
+                  );
+                } else {
+                  missingPaths.add(path);
+                }
+              } catch (e) {
+                missingPaths.add(path);
+              }
             } else if (path.isNotEmpty) {
               remotePhotos.add(path);
             }
@@ -1794,8 +2675,50 @@ class AuthService {
           request.fields[key] = value.toString();
         }
       }
+
+      if (missingPaths.isNotEmpty && request.files.isEmpty) {
+        // If none of the local files could be attached, fall back to JSON request.
+        final fallback = await _sendProviderProfileRequest(
+          fields,
+          method: method,
+        );
+        // Convert http.Response to http.StreamedResponse for the caller
+        final bytes = fallback.bodyBytes;
+        final streamed = http.StreamedResponse(
+          Stream.fromIterable([bytes]),
+          fallback.statusCode,
+          headers: fallback.headers,
+          contentLength: bytes.length,
+        );
+        return streamed;
+      }
+
+      if (missingPaths.isNotEmpty) {
+      }
+
       return await request.send();
     });
+  }
+
+  static Future<http.Response> _sendProviderProfileRequest(
+    Map<String, dynamic> fields, {
+    String method = 'PATCH',
+  }) async {
+    return _sendWithAuthRetry(
+      (headers) =>
+          (method == 'POST'
+                  ? http.post(
+                      Uri.parse('$_baseUrl/provider/profile'),
+                      headers: headers,
+                      body: jsonEncode(fields),
+                    )
+                  : http.patch(
+                      Uri.parse('$_baseUrl/provider/profile'),
+                      headers: headers,
+                      body: jsonEncode(fields),
+                    ))
+              .timeout(const Duration(seconds: 15)),
+    );
   }
 
   static Map<String, dynamic> _mergeProfileCache(
@@ -1804,10 +2727,9 @@ class AuthService {
     Map<String, dynamic> fields,
   ) {
     final merged = Map<String, dynamic>.from(cached);
-    final Map<String, dynamic> target =
-        merged['user'] is Map<String, dynamic>
-            ? (merged['user'] as Map<String, dynamic>)
-            : merged;
+    final Map<String, dynamic> target = merged['user'] is Map<String, dynamic>
+        ? (merged['user'] as Map<String, dynamic>)
+        : merged;
 
     final responseSource = _extractProfileSource(responseData);
     if (responseSource.isNotEmpty) {
@@ -1819,12 +2741,15 @@ class AuthService {
     for (final entry in fields.entries) {
       if (entry.value != null) {
         // Don't overwrite avatar/photos with local file paths; keep server URLs
-        if (entry.key == 'avatar' && _isLocalImagePath(entry.value?.toString())) {
+        if (entry.key == 'avatar' &&
+            _isLocalImagePath(entry.value?.toString())) {
           continue;
         }
         if (entry.key == 'photos' && entry.value is List) {
           final photos = entry.value as List;
-          final hasLocalPaths = photos.any((p) => _isLocalImagePath(p?.toString()));
+          final hasLocalPaths = photos.any(
+            (p) => _isLocalImagePath(p?.toString()),
+          );
           if (hasLocalPaths) {
             continue; // Keep server response photos
           }
@@ -1850,9 +2775,6 @@ class AuthService {
       if (!forceRefresh) {
         final cached = await _readCache(cacheKey);
         if (cached is List) {
-          print(
-            '[AuthService] Returning cached providers (${cached.length} items)',
-          );
           return {'success': true, 'data': cached, 'fromCache': true};
         }
       }
@@ -1863,17 +2785,13 @@ class AuthService {
           if (lng != null) 'lng': lng.toString(),
         },
       );
-      print('[AuthService] GET PROVIDERS → $uri');
       final res = await _sendWithAuthRetry(
         (headers) => http
             .get(uri, headers: headers)
             .timeout(const Duration(seconds: 15)),
       );
       if (res.statusCode == 401) {
-        await _clearStoredSession();
-        print('[AuthService] GET PROVIDERS: 401 Unauthorized - Token cleared');
       }
-      print('[AuthService] GET PROVIDERS status: ${res.statusCode}');
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
         final List<dynamic> raw =
@@ -1896,7 +2814,6 @@ class AuthService {
         }
 
         if (raw.isNotEmpty) {
-          print('[AuthService] Cached ${raw.length} providers with images');
         }
         return {'success': true, 'data': raw};
       }
@@ -1904,7 +2821,6 @@ class AuthService {
     } on SocketException {
       return {'success': false, 'message': 'No internet connection.'};
     } catch (e) {
-      print('[AuthService] GET PROVIDERS error: $e');
       return {'success': false, 'message': 'Unable to load providers.'};
     }
   }
@@ -1926,7 +2842,6 @@ class AuthService {
             .get(Uri.parse('$_baseUrl/public/categories'), headers: headers)
             .timeout(const Duration(seconds: 15)),
       );
-      print('[AuthService] GET CATEGORIES → ${res.statusCode}: ${res.body}');
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
         final List<dynamic> raw =
@@ -1936,10 +2851,6 @@ class AuthService {
             [];
         await _saveCache(cacheKey, raw);
         if (raw.isNotEmpty) {
-          print(
-            '[AuthService] GET CATEGORIES raw first item keys: ${(raw.first as Map).keys.toList()}',
-          );
-          print('[AuthService] GET CATEGORIES raw first item: ${raw.first}');
         }
         return {'success': true, 'data': raw};
       }
@@ -1951,7 +2862,6 @@ class AuthService {
       }
       return {'success': false, 'message': 'No internet connection.'};
     } catch (e) {
-      print('[AuthService] GET CATEGORIES error: $e');
       return {'success': false, 'message': 'Unable to load categories.'};
     }
   }
@@ -1965,7 +2875,6 @@ class AuthService {
       if (!forceRefresh) {
         final cached = await _readCache(cacheKey);
         if (cached is Map<String, dynamic>) {
-          print('[AuthService] Returning cached provider profile for $ulid');
           return {'success': true, 'data': cached, 'fromCache': true};
         }
       }
@@ -1975,7 +2884,6 @@ class AuthService {
             .get(Uri.parse('$_baseUrl/providers/$ulid'), headers: headers)
             .timeout(const Duration(seconds: 15)),
       );
-      print('[AuthService] GET PROVIDER PROFILE status: ${res.statusCode}');
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
         final Map<String, dynamic> raw =
@@ -1989,7 +2897,6 @@ class AuthService {
         // Also cache provider images separately for faster dashboard loading
         await saveProviderImages(ulid, raw);
 
-        print('[AuthService] Cached provider profile for $ulid');
         return {'success': true, 'data': raw};
       }
       final cached = await _readCache(cacheKey);
@@ -2004,7 +2911,6 @@ class AuthService {
       }
       return {'success': false, 'message': 'No internet connection.'};
     } catch (e) {
-      print('[AuthService] GET PROVIDER PROFILE error: $e');
       final cached = await _readCache(cacheKey);
       if (cached is Map<String, dynamic>) {
         return {'success': true, 'data': cached, 'fromCache': true};
@@ -2052,14 +2958,10 @@ class AuthService {
           if (lng != null) 'lng': lng.toString(),
         },
       );
-      print('[AuthService] GET PROVIDERS BY SUBCATEGORY → $uri');
       final res = await _sendWithAuthRetry(
         (headers) => http
             .get(uri, headers: headers)
             .timeout(const Duration(seconds: 15)),
-      );
-      print(
-        '[AuthService] GET PROVIDERS BY SUBCATEGORY status: ${res.statusCode}',
       );
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
@@ -2089,7 +2991,6 @@ class AuthService {
       }
       return {'success': false, 'message': 'No internet connection.'};
     } catch (e) {
-      print('[AuthService] GET PROVIDERS BY SUBCATEGORY error: $e');
       return {'success': false, 'message': 'Unable to load providers.'};
     }
   }
@@ -2112,11 +3013,15 @@ class AuthService {
     try {
       final token = await getToken();
       if (token == null || token.isEmpty) {
-        print('[AuthService] createJobDraft: No token available');
         return {
           'success': false,
           'message': 'Authentication required. Please log in again.',
         };
+      }
+
+      final roleReady = await _ensureCustomerRoleForJobs();
+      if (roleReady['success'] != true) {
+        return roleReady;
       }
 
       final requestBody = jsonEncode({
@@ -2148,8 +3053,6 @@ class AuthService {
           'open_to_category_providers': openToCategoryProviders,
       });
 
-      print('[AuthService] CREATE JOB DRAFT → $_baseUrl/jobs');
-      print('[AuthService] CREATE JOB DRAFT body: $requestBody');
 
       final res = await _sendWithAuthRetry(
         (headers) => http
@@ -2161,8 +3064,6 @@ class AuthService {
             .timeout(const Duration(seconds: 15)),
       );
 
-      print('[AuthService] CREATE JOB DRAFT status: ${res.statusCode}');
-      print('[AuthService] CREATE JOB DRAFT response: ${res.body}');
 
       if (res.statusCode == 200 || res.statusCode == 201) {
         final data = jsonDecode(res.body);
@@ -2171,7 +3072,6 @@ class AuthService {
       }
 
       if (res.statusCode == 401) {
-        await _clearStoredSession();
         return {
           'success': false,
           'auth_required': true,
@@ -2180,8 +3080,18 @@ class AuthService {
       }
 
       final data = jsonDecode(res.body);
+      if (res.statusCode == 403) {
+        return {
+          'success': false,
+          'statusCode': res.statusCode,
+          'message': 'Please switch to customer mode before creating a job.',
+          'data': data,
+        };
+      }
+
       return {
         'success': false,
+        'statusCode': res.statusCode,
         'message': _extractMessage(data) ?? 'Failed to create job draft.',
       };
     } on SocketException {
@@ -2190,23 +3100,49 @@ class AuthService {
         'message': 'No internet connection. Please check your network.',
       };
     } catch (e) {
-      print('[AuthService] CREATE JOB DRAFT error: $e');
       return {'success': false, 'message': 'Unable to create job draft.'};
     }
+  }
+
+  static Future<Map<String, dynamic>> _ensureCustomerRoleForJobs() async {
+    final activeRole = await getActiveRole();
+    final sessionRole = await getRole();
+    final normalizedActiveRole = activeRole?.trim();
+    final normalizedSessionRole = sessionRole?.trim();
+    if ((normalizedActiveRole == null ||
+            normalizedActiveRole.isEmpty ||
+            normalizedActiveRole == 'customer') &&
+        (normalizedSessionRole == null ||
+            normalizedSessionRole.isEmpty ||
+            normalizedSessionRole == 'customer')) {
+      return {'success': true};
+    }
+
+    final switchResult = await switchRole('customer');
+    if (switchResult['success'] == true) {
+      return {'success': true};
+    }
+
+    return {
+      'success': false,
+      'statusCode': switchResult['statusCode'],
+      'message':
+          switchResult['message']?.toString() ??
+          'Please switch to customer mode before creating a job.',
+      'data': switchResult['data'],
+    };
   }
 
   static Future<Map<String, dynamic>> publishJob(String jobUlid) async {
     try {
       final token = await getToken();
       if (token == null || token.isEmpty) {
-        print('[AuthService] publishJob: No token available');
         return {
           'success': false,
           'message': 'Authentication required. Please log in again.',
         };
       }
 
-      print('[AuthService] PUBLISH JOB → $_baseUrl/jobs/$jobUlid/publish');
 
       final res = await _sendWithAuthRetry(
         (headers) => http
@@ -2218,8 +3154,6 @@ class AuthService {
             .timeout(const Duration(seconds: 15)),
       );
 
-      print('[AuthService] PUBLISH JOB status: ${res.statusCode}');
-      print('[AuthService] PUBLISH JOB response: ${res.body}');
 
       if (res.statusCode == 200 || res.statusCode == 201) {
         final data = jsonDecode(res.body);
@@ -2228,7 +3162,6 @@ class AuthService {
       }
 
       if (res.statusCode == 401) {
-        await _clearStoredSession();
         return {
           'success': false,
           'auth_required': true,
@@ -2304,7 +3237,6 @@ class AuthService {
         'message': 'No internet connection. Please check your network.',
       };
     } catch (e) {
-      print('[AuthService] PUBLISH JOB error: $e');
       return {'success': false, 'message': 'Unable to publish job.'};
     }
   }
@@ -2316,16 +3248,12 @@ class AuthService {
     try {
       final token = await getToken();
       if (token == null || token.isEmpty) {
-        print('[AuthService] hireProvider: No token available');
         return {
           'success': false,
           'message': 'Authentication required. Please log in again.',
         };
       }
 
-      print(
-        '[AuthService] HIRE PROVIDER → $_baseUrl/jobs/$jobUlid/hire/$applicationUlid',
-      );
 
       final res = await _sendWithAuthRetry(
         (headers) => http
@@ -2336,8 +3264,6 @@ class AuthService {
             .timeout(const Duration(seconds: 15)),
       );
 
-      print('[AuthService] HIRE PROVIDER status: ${res.statusCode}');
-      print('[AuthService] HIRE PROVIDER response: ${res.body}');
 
       if (res.statusCode == 200 || res.statusCode == 201) {
         final data = jsonDecode(res.body);
@@ -2362,7 +3288,6 @@ class AuthService {
         'message': 'No internet connection. Please check your network.',
       };
     } catch (e) {
-      print('[AuthService] HIRE PROVIDER error: $e');
       return {'success': false, 'message': 'Unable to hire provider.'};
     }
   }
@@ -2373,7 +3298,6 @@ class AuthService {
     try {
       final token = await getToken();
       if (token == null || token.isEmpty) {
-        print('[AuthService] getWalletBalance: No token available');
         return {
           'success': false,
           'auth_required': true,
@@ -2387,20 +3311,13 @@ class AuthService {
             .timeout(const Duration(seconds: 15)),
       );
 
-      print('[AuthService] GET WALLET status: ${res.statusCode}');
-      print('[AuthService] GET WALLET response: ${res.body}');
 
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
-        print('[AuthService] GET WALLET decoded: $data');
         return {'success': true, 'data': data};
       }
 
       if (res.statusCode == 401) {
-        print(
-          '[AuthService] GET WALLET: 401 Unauthorized - Token may be invalid or expired',
-        );
-        await _clearStoredSession();
         return {
           'success': false,
           'auth_required': true,
@@ -2419,19 +3336,17 @@ class AuthService {
         'message': 'No internet connection. Please check your network.',
       };
     } catch (e) {
-      print('[AuthService] GET WALLET error: $e');
       return {'success': false, 'message': 'Unable to load wallet balance.'};
     }
   }
 
   static Future<Map<String, dynamic>> getTransactions({
-    int limit = 50,
-    int offset = 0,
+    int perPage = 50,
+    String? cursor,
   }) async {
     try {
       final token = await getToken();
       if (token == null || token.isEmpty) {
-        print('[AuthService] getTransactions: No token available');
         return {
           'success': false,
           'auth_required': true,
@@ -2444,8 +3359,8 @@ class AuthService {
             .get(
               Uri.parse('$_baseUrl/wallet/transactions').replace(
                 queryParameters: {
-                  'limit': limit.toString(),
-                  'offset': offset.toString(),
+                  'per_page': perPage.toString(),
+                  if (cursor != null) 'cursor': cursor,
                 },
               ),
               headers: headers,
@@ -2453,8 +3368,6 @@ class AuthService {
             .timeout(const Duration(seconds: 15)),
       );
 
-      print('[AuthService] GET TRANSACTIONS status: ${res.statusCode}');
-      print('[AuthService] GET TRANSACTIONS response: ${res.body}');
 
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
@@ -2462,10 +3375,6 @@ class AuthService {
       }
 
       if (res.statusCode == 401) {
-        print(
-          '[AuthService] GET TRANSACTIONS: 401 Unauthorized - Token may be invalid or expired',
-        );
-        await _clearStoredSession();
         return {
           'success': false,
           'auth_required': true,
@@ -2484,8 +3393,471 @@ class AuthService {
         'message': 'No internet connection. Please check your network.',
       };
     } catch (e) {
-      print('[AuthService] GET TRANSACTIONS error: $e');
       return {'success': false, 'message': 'Unable to load transactions.'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> getNotifications({
+    int limit = 50,
+    int offset = 0,
+  }) async {
+    try {
+      final token = await getToken();
+      if (token == null || token.isEmpty) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      final res = await _sendWithAuthRetry(
+        (headers) => http
+            .get(
+              Uri.parse('$_baseUrl/notifications').replace(
+                queryParameters: {
+                  'limit': limit.toString(),
+                  'offset': offset.toString(),
+                },
+              ),
+              headers: headers,
+            )
+            .timeout(const Duration(seconds: 15)),
+      );
+
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        return {'success': true, 'data': data};
+      }
+
+      if (res.statusCode == 401) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      final data = jsonDecode(res.body);
+      return {
+        'success': false,
+        'message': _extractMessage(data) ?? 'Failed to load notifications.',
+      };
+    } on SocketException {
+      return {
+        'success': false,
+        'message': 'No internet connection. Please check your network.',
+      };
+    } catch (e) {
+      return {'success': false, 'message': 'Unable to load notifications.'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> getKycStatus() async {
+    try {
+      final token = await getToken();
+      if (token == null || token.isEmpty) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      final res = await _sendWithAuthRetry(
+        (headers) => http
+            .get(Uri.parse('$_baseUrl/trust/kyc/status'), headers: headers)
+            .timeout(const Duration(seconds: 15)),
+      );
+
+
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        return {'success': true, 'data': data};
+      }
+
+      if (res.statusCode == 401) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      final data = jsonDecode(res.body);
+      return {
+        'success': false,
+        'message': _extractMessage(data) ?? 'Failed to load verification status.',
+      };
+    } on SocketException {
+      return {
+        'success': false,
+        'message': 'No internet connection. Please check your network.',
+      };
+    } catch (e) {
+      return {'success': false, 'message': 'Unable to load verification status.'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> sendPhoneOtp() async {
+    try {
+      final token = await getToken();
+      if (token == null || token.isEmpty) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      final requestBody = jsonEncode({'purpose': 'verify'});
+
+      final res = await _sendWithAuthRetry(
+        (headers) => http
+            .post(
+              Uri.parse('$_baseUrl/auth/otp/send'),
+              headers: headers,
+              body: requestBody,
+            )
+            .timeout(const Duration(seconds: 15)),
+      );
+
+
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        final data = jsonDecode(res.body);
+        return {'success': true, 'data': data};
+      }
+
+      if (res.statusCode == 401) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      final data = jsonDecode(res.body);
+      return {
+        'success': false,
+        'message': _extractMessage(data) ?? 'Failed to send verification code.',
+      };
+    } on SocketException {
+      return {
+        'success': false,
+        'message': 'No internet connection. Please check your network.',
+      };
+    } catch (e) {
+      return {'success': false, 'message': 'Unable to send verification code.'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> verifyPhoneOtp(String otp) async {
+    try {
+      final token = await getToken();
+      if (token == null || token.isEmpty) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      final requestBody = jsonEncode({'otp': otp, 'purpose': 'verify'});
+
+      final res = await _sendWithAuthRetry(
+        (headers) => http
+            .post(
+              Uri.parse('$_baseUrl/auth/otp/verify'),
+              headers: headers,
+              body: requestBody,
+            )
+            .timeout(const Duration(seconds: 15)),
+      );
+
+
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        final data = jsonDecode(res.body);
+        return {'success': true, 'data': data};
+      }
+
+      if (res.statusCode == 401) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      final data = jsonDecode(res.body);
+      return {
+        'success': false,
+        'message': _extractMessage(data) ?? 'Invalid or expired code.',
+      };
+    } on SocketException {
+      return {
+        'success': false,
+        'message': 'No internet connection. Please check your network.',
+      };
+    } catch (e) {
+      return {'success': false, 'message': 'Unable to verify code.'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> sendEmailVerificationLink() async {
+    try {
+      final token = await getToken();
+      if (token == null || token.isEmpty) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      final res = await _sendWithAuthRetry(
+        (headers) => http
+            .post(
+              Uri.parse('$_baseUrl/auth/email/verify/send'),
+              headers: headers,
+            )
+            .timeout(const Duration(seconds: 15)),
+      );
+
+
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        final data = jsonDecode(res.body);
+        return {'success': true, 'data': data};
+      }
+
+      if (res.statusCode == 401) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      final data = jsonDecode(res.body);
+      return {
+        'success': false,
+        'message':
+            _extractMessage(data) ?? 'Failed to send verification link.',
+      };
+    } on SocketException {
+      return {
+        'success': false,
+        'message': 'No internet connection. Please check your network.',
+      };
+    } catch (e) {
+      return {'success': false, 'message': 'Unable to send verification link.'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> confirmEmailVerification(String token) async {
+    try {
+      final authToken = await getToken();
+      if (authToken == null || authToken.isEmpty) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      final requestBody = jsonEncode({'token': token});
+
+      final res = await _sendWithAuthRetry(
+        (headers) => http
+            .post(
+              Uri.parse('$_baseUrl/auth/email/verify'),
+              headers: headers,
+              body: requestBody,
+            )
+            .timeout(const Duration(seconds: 15)),
+      );
+
+
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        final data = jsonDecode(res.body);
+        return {'success': true, 'data': data};
+      }
+
+      if (res.statusCode == 401) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      final data = jsonDecode(res.body);
+      return {
+        'success': false,
+        'message': _extractMessage(data) ?? 'Invalid or expired verification token.',
+      };
+    } on SocketException {
+      return {
+        'success': false,
+        'message': 'No internet connection. Please check your network.',
+      };
+    } catch (e) {
+      return {'success': false, 'message': 'Unable to verify email.'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> getR2PutUrl({
+    required String purpose,
+    required String mime,
+    required int sizeBytes,
+  }) async {
+    try {
+      final token = await getToken();
+      if (token == null || token.isEmpty) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      final uri = Uri.parse('$_baseUrl/uploads/r2-put-url').replace(
+        queryParameters: {
+          'purpose': purpose,
+          'mime': mime,
+          'size_bytes': sizeBytes.toString(),
+        },
+      );
+
+      final res = await _sendWithAuthRetry(
+        (headers) => http.get(uri, headers: headers).timeout(const Duration(seconds: 15)),
+      );
+
+
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        final data = jsonDecode(res.body);
+        return {'success': true, 'data': data};
+      }
+
+      if (res.statusCode == 401) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      final data = jsonDecode(res.body);
+      return {
+        'success': false,
+        'message': _extractMessage(data) ?? 'Failed to prepare file upload.',
+      };
+    } on SocketException {
+      return {
+        'success': false,
+        'message': 'No internet connection. Please check your network.',
+      };
+    } catch (e) {
+      return {'success': false, 'message': 'Unable to prepare file upload.'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> uploadBytesToUrl({
+    required String uploadUrl,
+    required Map<String, dynamic> headers,
+    required Uint8List bytes,
+  }) async {
+    try {
+      final putHeaders = headers.map(
+        (key, value) => MapEntry(key.toString(), value.toString()),
+      );
+
+      final res = await http
+          .put(Uri.parse(uploadUrl), headers: putHeaders, body: bytes)
+          .timeout(const Duration(seconds: 60));
+
+
+      if (res.statusCode == 200 || res.statusCode == 201 || res.statusCode == 204) {
+        return {'success': true};
+      }
+
+      return {
+        'success': false,
+        'message': 'Upload failed (status ${res.statusCode}).',
+      };
+    } on SocketException {
+      return {
+        'success': false,
+        'message': 'No internet connection. Please check your network.',
+      };
+    } catch (e) {
+      return {'success': false, 'message': 'Unable to upload file.'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> submitKycVerification({
+    required String nin,
+    required String bvn,
+    required String dob,
+    required String selfieUrl,
+  }) async {
+    try {
+      final token = await getToken();
+      if (token == null || token.isEmpty) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      final requestBody = jsonEncode({
+        'level': 2,
+        'nin': nin,
+        'bvn': bvn,
+        'dob': dob,
+        'selfie_url': selfieUrl,
+      });
+
+      final res = await _sendWithAuthRetry(
+        (headers) => http
+            .post(
+              Uri.parse('$_baseUrl/trust/kyc/submit'),
+              headers: headers,
+              body: requestBody,
+            )
+            .timeout(const Duration(seconds: 15)),
+      );
+
+
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        final data = jsonDecode(res.body);
+        return {'success': true, 'data': data};
+      }
+
+      if (res.statusCode == 401) {
+        return {
+          'success': false,
+          'auth_required': true,
+          'message': 'Authentication required. Please log in again.',
+        };
+      }
+
+      final data = jsonDecode(res.body);
+      return {
+        'success': false,
+        'message':
+            _extractMessage(data) ?? 'Failed to submit identity verification.',
+      };
+    } on SocketException {
+      return {
+        'success': false,
+        'message': 'No internet connection. Please check your network.',
+      };
+    } catch (e) {
+      return {
+        'success': false,
+        'message': 'Unable to submit identity verification.',
+      };
     }
   }
 
@@ -2496,7 +3868,6 @@ class AuthService {
     try {
       final token = await getToken();
       if (token == null || token.isEmpty) {
-        print('[AuthService] initiateTopup: No token available');
         return {
           'success': false,
           'message': 'Authentication required. Please log in again.',
@@ -2519,8 +3890,6 @@ class AuthService {
             .timeout(const Duration(seconds: 15)),
       );
 
-      print('[AuthService] TOPUP status: ${res.statusCode}');
-      print('[AuthService] TOPUP response: ${res.body}');
 
       if (res.statusCode == 200 || res.statusCode == 201) {
         final data = jsonDecode(res.body);
@@ -2528,7 +3897,6 @@ class AuthService {
       }
 
       if (res.statusCode == 401) {
-        await _clearStoredSession();
         return {
           'success': false,
           'auth_required': true,
@@ -2547,8 +3915,308 @@ class AuthService {
         'message': 'No internet connection. Please check your network.',
       };
     } catch (e) {
-      print('[AuthService] TOPUP error: $e');
       return {'success': false, 'message': 'Unable to initiate top-up.'};
+    }
+  }
+
+  // GET /api/v1/threads — list chat threads for the authenticated user
+  static Future<Map<String, dynamic>> getThreads({
+    String? filter,
+    int limit = 30,
+  }) async {
+    final filterKey = (filter == null || filter.isEmpty) ? 'all' : filter;
+    try {
+      final params = <String, String>{'limit': limit.toString()};
+      if (filter != null && filter.isNotEmpty) params['filter'] = filter;
+      final uri = Uri.parse('$_baseUrl/threads').replace(queryParameters: params);
+      final res = await _sendWithAuthRetry(
+        (headers) => http.get(uri, headers: headers).timeout(const Duration(seconds: 15)),
+      );
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final List<dynamic> threads = (data is List ? data : null) ??
+            (data['data'] is List ? data['data'] as List : null) ??
+            (data['threads'] is List ? data['threads'] as List : null) ??
+            [];
+        await _saveThreadsCache(filterKey, threads);
+        return {'success': true, 'data': threads};
+      }
+      if (res.statusCode == 401) return {'success': false, 'auth_required': true};
+      return {'success': false, 'message': 'Failed to load messages.'};
+    } on SocketException {
+      return {'success': false, 'message': 'No internet connection.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Unable to load messages.'};
+    }
+  }
+
+  /// Returns the message threads cached for the current account/filter,
+  /// or null if nothing has been cached yet. Used to render the messages
+  /// screen instantly while a fresh copy loads in the background.
+  static Future<List<dynamic>?> getCachedThreads(String? filter) async {
+    final filterKey = (filter == null || filter.isEmpty) ? 'all' : filter;
+    try {
+      final key = await _accountScopedCacheKey('threads_$filterKey');
+      final prefs = await SharedPreferences.getInstance();
+      final cached = prefs.getString(key);
+      if (cached == null) return null;
+      final data = jsonDecode(cached);
+      if (data is List) return data;
+    } catch (_) {}
+    return null;
+  }
+
+  static Future<void> _saveThreadsCache(
+    String filterKey,
+    List<dynamic> threads,
+  ) async {
+    try {
+      final key = await _accountScopedCacheKey('threads_$filterKey');
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(key, jsonEncode(threads));
+    } catch (_) {}
+  }
+
+  /// Builds a cache key scoped to the currently signed-in account so that
+  /// switching between accounts on the same device doesn't leak cached data
+  /// (e.g. message threads) between users.
+  static Future<String> _accountScopedCacheKey(String name) async {
+    final prefs = await SharedPreferences.getInstance();
+    final email = prefs.getString(_currentAccountEmailKey) ?? 'guest';
+    return _cacheKey('${email}_$name');
+  }
+
+  // GET /api/v1/threads/{ulid} — get thread metadata (participants, typing status, etc.)
+  static Future<Map<String, dynamic>> getThread(String ulid) async {
+    try {
+      final res = await _sendWithAuthRetry(
+        (headers) => http
+            .get(Uri.parse('$_baseUrl/threads/$ulid'), headers: headers)
+            .timeout(const Duration(seconds: 10)),
+      );
+      if (res.statusCode == 200) {
+        final raw = jsonDecode(res.body);
+        final Map<String, dynamic> thread = (raw is Map<String, dynamic> && raw['data'] is Map)
+            ? (raw['data'] as Map).cast<String, dynamic>()
+            : (raw is Map<String, dynamic> ? raw : <String, dynamic>{});
+        return {'success': true, 'data': thread};
+      }
+      if (res.statusCode == 401) return {'success': false, 'auth_required': true};
+      return {'success': false, 'message': 'Failed to load thread.'};
+    } on SocketException {
+      return {'success': false, 'message': 'No internet connection.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Unable to load thread.'};
+    }
+  }
+
+  // POST /api/v1/threads/{ulid}/typing — broadcast a typing indicator to the thread
+  static Future<void> sendTypingIndicator(String ulid) async {
+    try {
+      await _sendWithAuthRetry(
+        (headers) => http
+            .post(Uri.parse('$_baseUrl/threads/$ulid/typing'), headers: headers)
+            .timeout(const Duration(seconds: 5)),
+      );
+    } catch (_) {}
+  }
+
+  static Future<Map<String, dynamic>> getMessages({
+    String? threadUlid,
+    String? jobUlid,
+    int limit = 50,
+    int offset = 0,
+  }) async {
+    try {
+      final params = <String, String>{'limit': limit.toString()};
+      if (offset > 0) params['offset'] = offset.toString();
+      if (threadUlid != null) params['thread_ulid'] = threadUlid;
+      if (jobUlid != null) params['job_ulid'] = jobUlid;
+      final uri = Uri.parse('$_baseUrl/messages').replace(queryParameters: params);
+      final res = await _sendWithAuthRetry(
+        (headers) => http.get(uri, headers: headers).timeout(const Duration(seconds: 15)),
+      );
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final List<dynamic> messages = (data['data'] is List ? data['data'] as List : null) ??
+            (data is List ? data : null) ??
+            [];
+        return {'success': true, 'data': messages};
+      }
+      if (res.statusCode == 401) return {'success': false, 'auth_required': true};
+      return {'success': false, 'message': 'Failed to load messages.'};
+    } on SocketException {
+      return {'success': false, 'message': 'No internet connection.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Unable to load messages.'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> sendVoiceMessage({
+    required Uint8List bytes,
+    required String mimeType,
+    required int durationSeconds,
+    String? threadUlid,
+    String? jobUlid,
+  }) async {
+    // Step 1: get pre-signed upload URL
+    print('[VoiceUpload] Step 1 — getR2PutUrl purpose=voice_note mime=$mimeType size=${bytes.length}');
+    final signed = await getR2PutUrl(
+      purpose: 'voice_note',
+      mime: mimeType,
+      sizeBytes: bytes.length,
+    );
+    print('[VoiceUpload] R2 response => $signed');
+    if (signed['success'] != true) return signed;
+
+    final uploadInfo = signed['data'] is Map
+        ? Map<String, dynamic>.from(signed['data'] as Map)
+        : <String, dynamic>{};
+    final uploadUrl = (uploadInfo['upload_url'] ?? '').toString();
+    final objectUrl =
+        (uploadInfo['object_url'] ?? uploadInfo['object_key'] ?? '').toString();
+    final uploadHeaders = uploadInfo['headers'] is Map
+        ? Map<String, dynamic>.from(uploadInfo['headers'] as Map)
+        : <String, dynamic>{'Content-Type': mimeType};
+
+    print('[VoiceUpload] upload_url=$uploadUrl  object_url=$objectUrl');
+
+    if (uploadUrl.isEmpty) {
+      return {'success': false, 'message': 'Failed to get upload URL.'};
+    }
+
+    // Step 2: upload the bytes
+    print('[VoiceUpload] Step 2 — uploading ${bytes.length} bytes');
+    final uploaded = await uploadBytesToUrl(
+      uploadUrl: uploadUrl,
+      headers: uploadHeaders,
+      bytes: bytes,
+    );
+    print('[VoiceUpload] Upload result => $uploaded');
+    if (uploaded['success'] != true) return uploaded;
+
+    // Step 3: post the message with the URL + duration
+    print('[VoiceUpload] Step 3 — sendMessage kind=voice url=$objectUrl duration=${durationSeconds}s');
+    try {
+      final payload = <String, dynamic>{
+        'kind': 'voice',
+        'voice_note_url': objectUrl,
+        'duration_seconds': durationSeconds,
+      };
+      if (threadUlid != null) payload['thread_ulid'] = threadUlid;
+      if (jobUlid != null) payload['job_ulid'] = jobUlid;
+
+      final res = await _sendWithAuthRetry(
+        (headers) => http
+            .post(
+              Uri.parse('$_baseUrl/messages'),
+              headers: {...headers, 'Content-Type': 'application/json'},
+              body: jsonEncode(payload),
+            )
+            .timeout(const Duration(seconds: 20)),
+      );
+      print('[VoiceUpload] sendMessage status=${res.statusCode} body=${res.body}');
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        return {'success': true, 'data': jsonDecode(res.body)};
+      }
+      if (res.statusCode == 401) {
+        return {'success': false, 'auth_required': true, 'message': 'Authentication required.'};
+      }
+      final data = jsonDecode(res.body);
+      return {'success': false, 'message': _extractMessage(data) ?? 'Failed to send voice message.'};
+    } on SocketException {
+      return {'success': false, 'message': 'No internet connection.'};
+    } catch (e) {
+      print('[VoiceUpload] sendMessage ERROR: $e');
+      return {'success': false, 'message': 'Failed to send voice message.'};
+    }
+  }
+
+  static Future<Map<String, dynamic>> sendMessage({
+    required String body,
+    String? threadUlid,
+    String? jobUlid,
+    String kind = 'text',
+  }) async {
+    try {
+      final payload = <String, dynamic>{'kind': kind, 'body': body};
+      if (threadUlid != null) payload['thread_ulid'] = threadUlid;
+      if (jobUlid != null) payload['job_ulid'] = jobUlid;
+      final res = await _sendWithAuthRetry(
+        (headers) => http
+            .post(
+              Uri.parse('$_baseUrl/messages'),
+              headers: {...headers, 'Content-Type': 'application/json'},
+              body: jsonEncode(payload),
+            )
+            .timeout(const Duration(seconds: 20)),
+      );
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        final data = jsonDecode(res.body);
+        return {'success': true, 'data': data};
+      }
+      if (res.statusCode == 401) return {'success': false, 'auth_required': true};
+      final data = jsonDecode(res.body);
+      return {'success': false, 'message': _extractMessage(data) ?? 'Failed to send message.'};
+    } on SocketException {
+      return {'success': false, 'message': 'No internet connection.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Request timed out. Please try again.'};
+    }
+  }
+
+  static Future<void> markThreadRead(String threadUlid) async {
+    try {
+      await _sendWithAuthRetry(
+        (headers) => http
+            .post(Uri.parse('$_baseUrl/threads/$threadUlid/read'), headers: headers)
+            .timeout(const Duration(seconds: 10)),
+      );
+    } catch (_) {}
+  }
+
+  static Future<void> markMessageRead(String messageUlid) async {
+    try {
+      await _sendWithAuthRetry(
+        (headers) => http
+            .post(Uri.parse('$_baseUrl/messages/$messageUlid/read'), headers: headers)
+            .timeout(const Duration(seconds: 10)),
+      );
+    } catch (_) {}
+  }
+
+  static Future<Map<String, dynamic>> getOrCreateDirectThread(String providerUlid) async {
+    try {
+      await switchRole('customer');
+      final res = await _sendWithAuthRetry(
+        (headers) => http
+            .post(
+              Uri.parse('$_baseUrl/threads'),
+              headers: {...headers, 'Content-Type': 'application/json'},
+              body: jsonEncode({'provider_ulid': providerUlid}),
+            )
+            .timeout(const Duration(seconds: 20)),
+      );
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        final raw = jsonDecode(res.body);
+        // Unwrap common response envelope: {data: {ulid:...}} → {ulid:...}
+        final Map<String, dynamic> thread;
+        if (raw is Map<String, dynamic> && raw['data'] is Map) {
+          thread = (raw['data'] as Map).cast<String, dynamic>();
+        } else if (raw is Map<String, dynamic>) {
+          thread = raw;
+        } else {
+          thread = <String, dynamic>{};
+        }
+        return {'success': true, 'data': thread};
+      }
+      if (res.statusCode == 401) return {'success': false, 'auth_required': true};
+      final data = jsonDecode(res.body);
+      return {'success': false, 'message': _extractMessage(data) ?? 'Failed to start conversation.'};
+    } on SocketException {
+      return {'success': false, 'message': 'No internet connection.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Request timed out. Please try again.'};
     }
   }
 
@@ -2556,7 +4224,6 @@ class AuthService {
     try {
       final token = await getToken();
       if (token == null || token.isEmpty) {
-        print('[AuthService] getTopupStatus: No token available');
         return {
           'success': false,
           'message': 'Authentication required. Please log in again.',
@@ -2572,8 +4239,6 @@ class AuthService {
             .timeout(const Duration(seconds: 15)),
       );
 
-      print('[AuthService] TOPUP STATUS status: ${res.statusCode}');
-      print('[AuthService] TOPUP STATUS response: ${res.body}');
 
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
@@ -2581,7 +4246,6 @@ class AuthService {
       }
 
       if (res.statusCode == 401) {
-        await _clearStoredSession();
         return {
           'success': false,
           'auth_required': true,
@@ -2600,8 +4264,8 @@ class AuthService {
         'message': 'No internet connection. Please check your network.',
       };
     } catch (e) {
-      print('[AuthService] TOPUP STATUS error: $e');
       return {'success': false, 'message': 'Unable to load top-up status.'};
     }
   }
+
 }

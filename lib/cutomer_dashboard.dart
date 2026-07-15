@@ -1,9 +1,14 @@
-import 'package:cached_network_image/cached_network_image.dart';
+﻿import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'location_service.dart';
 import 'auth_service.dart';
+import 'user_jobs_page.dart';
+import 'user_profile_page.dart';
+import 'user_transactions_page.dart';
+import 'saved_providers_page.dart';
 import 'linq_theme.dart';
 
 class HomePage extends StatefulWidget {
@@ -87,11 +92,12 @@ class _HomePageState extends State<HomePage> {
     _loadActiveRole();
     _loadCategories();
     _loadProvidersFromCacheFirst();
+    AuthService.refreshUnreadMessageCount();
+    AuthService.refreshUnreadNotificationCount();
   }
 
   Future<void> _loadActiveRole() async {
     final role = await AuthService.getActiveRole();
-    print('[CustomerDashboard] Loaded active role: $role');
     if (mounted) {
       setState(() {
         _activeRole = role ?? 'customer';
@@ -102,7 +108,6 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _handleRoleSwitch(String newRole) async {
     if (newRole == _activeRole) {
-      print('[CustomerDashboard] Role switch ignored - already in $newRole mode');
       return;
     }
 
@@ -111,41 +116,95 @@ class _HomePageState extends State<HomePage> {
       _switchingRole = true;
     });
 
-    print('[CustomerDashboard] Initiating role switch from $_activeRole to $newRole');
 
     try {
       final result = await AuthService.switchRole(newRole);
-      print('[CustomerDashboard] switchRole result: $result');
 
       if (!mounted) return;
 
       if (result['success'] == true) {
-        print('[CustomerDashboard] Role switch successful, updating state');
         setState(() {
           _activeRole = newRole;
         });
 
-        final targetRoute =
-            newRole == 'provider' ? '/provider-dashboard' : '/customer-dashboard';
-        
-        print('[CustomerDashboard] Navigating to: $targetRoute');
-        
-        Navigator.pushNamedAndRemoveUntil(
-          context,
-          targetRoute,
-          (route) {
-            print('[CustomerDashboard] Removing route: ${route.settings.name}');
-            return false;
-          },
-        );
+        final targetRoute = newRole == 'provider'
+            ? '/provider-dashboard'
+            : '/customer-dashboard';
+
+
+        Navigator.pushNamedAndRemoveUntil(context, targetRoute, (route) {
+          return false;
+        });
       } else {
-        print('[CustomerDashboard] Role switch failed: ${result['message']}');
+
+        final status = result['statusCode'] is int
+            ? result['statusCode'] as int
+            : null;
+        if (status == 409) {
+          // Account already linked for that role. If we have provider data cached, navigate there.
+          final cached = await AuthService.getCachedProfile();
+          var hasProvider = false;
+          if (cached != null) {
+            if (cached['provider'] is Map) hasProvider = true;
+            if (!hasProvider &&
+                cached['role'] is String &&
+                cached['role'] == 'provider')
+              hasProvider = true;
+            if (!hasProvider && cached['user'] is Map) {
+              final user = cached['user'] as Map<String, dynamic>;
+              if ((user['role'] is String && user['role'] == 'provider') ||
+                  user['provider'] is Map)
+                hasProvider = true;
+            }
+          }
+
+          if (hasProvider) {
+            // Persist the role change even though the switch endpoint returned 409
+            await AuthService.setActiveRole('provider');
+            if (!mounted) return;
+            setState(() {
+              _activeRole = 'provider';
+            });
+            Navigator.pushNamedAndRemoveUntil(
+              context,
+              '/provider-dashboard',
+              (route) => false,
+            );
+            return;
+          } else {
+            // Show dialog informing the user their account is already linked and suggest next steps
+            if (mounted) {
+              showDialog(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('Account Linked'),
+                  content: Text(
+                    result['message']?.toString() ??
+                        'An account is already linked for that role.',
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () {
+                        Navigator.of(ctx).pop();
+                        setState(() {
+                          _switchingRole = false;
+                        });
+                      },
+                      child: const Text('OK'),
+                    ),
+                  ],
+                ),
+              );
+              return;
+            }
+          }
+        }
+
         setState(() {
           _switchingRole = false;
         });
       }
     } catch (error) {
-      print('[CustomerDashboard] Role switch error: $error');
       if (mounted) {
         setState(() {
           _switchingRole = false;
@@ -169,22 +228,24 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  void _handleNavigation(int index, String route) {
-    print('[CustomerDashboard] Navigation tapped: index=$index, route=$route');
-    
-    final currentRoute = ModalRoute.of(context)?.settings.name;
-    print('[CustomerDashboard] Current route: $currentRoute');
-    
-    if (currentRoute == route) {
-      print('[CustomerDashboard] Already on this route, skipping navigation');
-      return;
-    }
-
+  void _handleNavigation(int index) {
     setState(() {
       _selectedNavIndex = index;
     });
-
-    Navigator.pushReplacementNamed(context, route);
+    // Update status bar style based on active tab
+    SystemChrome.setSystemUIOverlayStyle(
+      index == 0
+          ? const SystemUiOverlayStyle(
+              statusBarColor: Colors.transparent,
+              statusBarIconBrightness: Brightness.dark,
+              statusBarBrightness: Brightness.light,
+            )
+          : SystemUiOverlayStyle.light.copyWith(
+              statusBarColor: LinqColors.forest500,
+              statusBarIconBrightness: Brightness.light,
+              statusBarBrightness: Brightness.dark,
+            ),
+    );
   }
 
   Future<void> _loadProvidersFromCacheFirst() async {
@@ -199,9 +260,6 @@ class _HomePageState extends State<HomePage> {
           _providersLoading = false;
         });
       }
-      print(
-        '[Dashboard] Loaded ${cachedProviders.length} providers from persistent cache',
-      );
       await _initLocation(forceRefresh: true);
       return;
     }
@@ -262,9 +320,6 @@ class _HomePageState extends State<HomePage> {
                         )
                         .toList()
                   : <Map<String, dynamic>>[]);
-              print(
-                '[Dashboard] category="$name" id="$id" slug="$slug" childCount=${children.length}',
-              );
               return <String, dynamic>{
                 'id': id,
                 'slug': slug,
@@ -392,39 +447,60 @@ class _HomePageState extends State<HomePage> {
         _filteredProviders.isEmpty;
 
     return WillPopScope(
-      onWillPop: () async => false, // Prevent back button from popping to login
-      child: Stack(
-        children: [
-          Scaffold(
-            backgroundColor: LinqColors.bgPageApp,
-            bottomNavigationBar: BottomNavBar(
-              selectedIndex: _selectedNavIndex,
-              onNavigate: _handleNavigation,
-            ),
-            body: SafeArea(
-              child: Column(
+      onWillPop: () async => false,
+      child: AnnotatedRegion<SystemUiOverlayStyle>(
+        value: _selectedNavIndex == 0
+            ? const SystemUiOverlayStyle(
+                statusBarColor: Colors.transparent,
+                statusBarIconBrightness: Brightness.dark,
+                statusBarBrightness: Brightness.light,
+              )
+            : SystemUiOverlayStyle.light.copyWith(
+                statusBarColor: LinqColors.forest500,
+                statusBarIconBrightness: Brightness.light,
+                statusBarBrightness: Brightness.dark,
+              ),
+        child: Stack(
+          children: [
+            Scaffold(
+              backgroundColor: LinqColors.bgPageApp,
+              bottomNavigationBar: BottomNavBar(
+                selectedIndex: _selectedNavIndex,
+                onNavigate: _handleNavigation,
+              ),
+              body: SafeArea(
+              child: IndexedStack(
+                index: _selectedNavIndex,
                 children: [
-                  _buildTopBar(),
-                  _buildHeroSection(),
-                  Expanded(
-                    child: noResults
-                        ? _buildEmptyState()
-                        : RefreshIndicator(
-                            onRefresh: _onRefresh,
-                            color: LinqColors.forest500,
-                            child: SingleChildScrollView(
-                              physics: const AlwaysScrollableScrollPhysics(),
-                              child: Column(
-                                children: [
-                                  _buildCategories(),
-                                  _buildLinqMatchSection(),
-                                  _buildTrustBanner(),
-                                  const SizedBox(height: 100),
-                                ],
+                  Column(
+                    children: [
+                      _buildTopBar(),
+                      _buildHeroSection(),
+                      Expanded(
+                        child: noResults
+                            ? _buildEmptyState()
+                            : RefreshIndicator(
+                                onRefresh: _onRefresh,
+                                color: LinqColors.forest500,
+                                child: SingleChildScrollView(
+                                  physics: const AlwaysScrollableScrollPhysics(),
+                                  child: Column(
+                                    children: [
+                                      _buildCategories(),
+                                      _buildLinqMatchSection(),
+                                      _buildTrustBanner(),
+                                      const SizedBox(height: 100),
+                                    ],
+                                  ),
+                                ),
                               ),
-                            ),
-                          ),
+                      ),
+                    ],
                   ),
+                  const UserJobsPage(showBottomNav: false),
+                  const UserTransactionsPage(showBottomNav: false),
+                  const SavedProvidersPage(showBottomNav: false),
+                  const UserProfilePage(showBottomNav: false),
                 ],
               ),
             ),
@@ -445,6 +521,7 @@ class _HomePageState extends State<HomePage> {
             ),
         ],
       ),
+    ),
     );
   }
 
@@ -456,66 +533,16 @@ class _HomePageState extends State<HomePage> {
     return Container(
       padding: const EdgeInsets.symmetric(
         horizontal: LinqSpacing.s5,
-        vertical: LinqSpacing.s4,
+        vertical: LinqSpacing.s2_5,
       ),
       decoration: const BoxDecoration(
         color: LinqColors.bgSurface,
-        border: Border(
-          bottom: BorderSide(color: LinqColors.borderDefault),
-        ),
+        border: Border(bottom: BorderSide(color: LinqColors.borderDefault)),
       ),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          // Left: person icon + role label (tappable)
-          GestureDetector(
-            onTap: _showRoleMenu,
-            child: Container(
-              padding: const EdgeInsets.symmetric(
-                horizontal: LinqSpacing.s3,
-                vertical: LinqSpacing.s2,
-              ),
-              decoration: BoxDecoration(
-                color: LinqColors.forest50,
-                border: Border.all(color: LinqColors.forest200),
-                borderRadius: BorderRadius.circular(20),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  
-                  Container(
-                    width: 28,
-                    height: 28,
-                    decoration: const BoxDecoration(
-                      color: LinqColors.forest500,
-                      shape: BoxShape.circle,
-                    ),
-                    child: const Icon(
-                      Icons.person,
-                      color: LinqColors.textOnBrand,
-                      size: 16,
-                    ),
-                  ),
-                  const SizedBox(width: LinqSpacing.s2),
-                  Text(
-                    roleDisplay,
-                    style: LinqTextStyles.label.copyWith(
-                      color: LinqColors.forest500,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  const SizedBox(width: LinqSpacing.s1),
-                  const Icon(
-                    Icons.keyboard_arrow_down_rounded,
-                    color: LinqColors.forest500,
-                    size: 18,
-                  ),
-                ],
-              ),
-            ),
-          ),
-          // Right: LINQ brand text
+          // Left: LINQ brand text
           Text(
             'LINQ',
             style: LinqTextStyles.h4.copyWith(
@@ -523,6 +550,115 @@ class _HomePageState extends State<HomePage> {
               letterSpacing: 2,
               fontWeight: FontWeight.w900,
             ),
+          ),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ValueListenableBuilder<int>(
+                valueListenable: AuthService.unreadMessageCount,
+                builder: (context, count, _) => IconButton(
+                  tooltip: 'Messages',
+                  onPressed: () async {
+                    await Navigator.pushNamed(context, '/messages');
+                    AuthService.refreshUnreadMessageCount();
+                  },
+                  icon: Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      const Icon(
+                        Icons.chat_bubble_outline_rounded,
+                        color: LinqColors.forest500,
+                      ),
+                      if (count > 0)
+                        Positioned(
+                          right: -5,
+                          top: -4,
+                          child: Container(
+                            constraints: const BoxConstraints(minWidth: 16),
+                            height: 16,
+                            padding: const EdgeInsets.symmetric(horizontal: 3),
+                            decoration: BoxDecoration(
+                              color: LinqColors.danger500,
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: LinqColors.bgSurface,
+                                width: 1.5,
+                              ),
+                            ),
+                            child: Center(
+                              child: Text(
+                                count > 99 ? '99+' : '$count',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 9,
+                                  fontWeight: FontWeight.w800,
+                                  height: 1,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+              ValueListenableBuilder<int>(
+                valueListenable: AuthService.unreadNotificationCount,
+                builder: (context, notifCount, _) => IconButton(
+                  tooltip: 'Notifications',
+                  onPressed: () async {
+                    await Navigator.pushNamed(context, '/notifications');
+                    AuthService.refreshUnreadNotificationCount();
+                  },
+                  icon: Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      const Icon(
+                        Icons.notifications_none_rounded,
+                        color: LinqColors.forest500,
+                      ),
+                      if (notifCount > 0)
+                        Positioned(
+                          right: -5,
+                          top: -4,
+                          child: Container(
+                            constraints: const BoxConstraints(minWidth: 16),
+                            height: 16,
+                            padding: const EdgeInsets.symmetric(horizontal: 3),
+                            decoration: BoxDecoration(
+                              color: LinqColors.danger500,
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: LinqColors.bgSurface,
+                                width: 1.5,
+                              ),
+                            ),
+                            child: Center(
+                              child: Text(
+                                notifCount > 99 ? '99+' : '$notifCount',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 9,
+                                  fontWeight: FontWeight.w800,
+                                  height: 1,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+              // IconButton(
+              //   tooltip: roleDisplay,
+              //   onPressed: _showRoleMenu,
+              //   icon: const Icon(
+              //     Icons.person_outline_rounded,
+              //     color: LinqColors.forest500,
+              //   ),
+              // ),
+            ],
           ),
         ],
       ),
@@ -567,7 +703,7 @@ class _HomePageState extends State<HomePage> {
             decoration: InputDecoration(
               filled: true,
               fillColor: LinqColors.bgSurface,
-              hintText: 'What service do you need?',
+              hintText: 'Search category or provider',
               hintStyle: LinqTextStyles.body.copyWith(
                 color: LinqColors.textTertiary,
               ),
@@ -805,136 +941,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget _buildProviderCard(Map<String, dynamic> pro) {
-    final imageUrl = (pro['image'] ?? '').toString().trim();
-    return Container(
-      margin: const EdgeInsets.only(bottom: LinqSpacing.s5),
-      decoration: BoxDecoration(
-        color: LinqColors.bgSurface,
-        borderRadius: LinqRadius.borderLg,
-        border: Border.all(color: LinqColors.borderDefault),
-        boxShadow: LinqShadows.xs,
-      ),
-      child: Column(
-        children: [
-          Stack(
-            children: [
-              ClipRRect(
-                borderRadius: const BorderRadius.vertical(
-                  top: Radius.circular(12),
-                ),
-                child: imageUrl.isEmpty
-                    ? Container(
-                        height: 200,
-                        width: double.infinity,
-                        color: LinqColors.stone100,
-                        child: const Icon(
-                          Icons.person,
-                          size: 80,
-                          color: LinqColors.stone300,
-                        ),
-                      )
-                    : CachedNetworkImage(
-                        imageUrl: imageUrl,
-                        height: 200,
-                        width: double.infinity,
-                        fit: BoxFit.cover,
-                        errorListener: (_) {
-                          CachedNetworkImage.evictFromCache(imageUrl);
-                        },
-                        placeholder: (_, __) =>
-                            Container(height: 200, color: LinqColors.stone100),
-                        errorWidget: (_, __, ___) => Container(
-                          height: 200,
-                          color: LinqColors.stone100,
-                          child: const Icon(
-                            Icons.person,
-                            size: 80,
-                            color: LinqColors.stone300,
-                          ),
-                        ),
-                      ),
-              ),
-              Positioned(top: 12, left: 12, child: linqVerifiedBadge()),
-            ],
-          ),
-          Padding(
-            padding: const EdgeInsets.all(LinqSpacing.s4),
-            child: Column(
-              children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        pro['name'].toString(),
-                        style: LinqTextStyles.h4.copyWith(
-                          color: LinqColors.forest500,
-                        ),
-                      ),
-                    ),
-                    Row(
-                      children: [
-                        const Icon(Icons.star, size: 16, color: Colors.amber),
-                        const SizedBox(width: 2),
-                        Text(
-                          pro['rating'].toString(),
-                          style: LinqTextStyles.bodySm,
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    pro['role'].toString(),
-                    style: LinqTextStyles.bodySm.copyWith(
-                      color: LinqColors.forest400,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    Text('📍 ${pro['distance']}', style: LinqTextStyles.bodySm),
-                    const SizedBox(width: 16),
-                    Text(
-                      '⏰ ${pro['availability']}',
-                      style: LinqTextStyles.bodySm,
-                    ),
-                  ],
-                ),
-                const SizedBox(height: LinqSpacing.s4),
-                SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: LinqColors.forest500,
-                      foregroundColor: LinqColors.textOnBrand,
-                      padding: const EdgeInsets.symmetric(vertical: 14),
-                      elevation: 0,
-                      shape: RoundedRectangleBorder(
-                        borderRadius: LinqRadius.borderMd,
-                      ),
-                    ),
-                    onPressed: () => Navigator.pushNamed(
-                      context,
-                      '/provider-profile',
-                      arguments: pro,
-                    ),
-                    child: const Text(
-                      'View profile',
-                      style: TextStyle(fontWeight: FontWeight.w600),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
+    return _ProviderCardWidget(provider: pro);
   }
 
   Widget _buildTrustBanner() {
@@ -1004,10 +1011,7 @@ class _RoleSwitchSheet extends StatefulWidget {
   final String activeRole;
   final void Function(String) onSwitch;
 
-  const _RoleSwitchSheet({
-    required this.activeRole,
-    required this.onSwitch,
-  });
+  const _RoleSwitchSheet({required this.activeRole, required this.onSwitch});
 
   @override
   State<_RoleSwitchSheet> createState() => _RoleSwitchSheetState();
@@ -1114,9 +1118,7 @@ class _RoleSwitchSheetState extends State<_RoleSwitchSheet>
               ),
               // Role options
               Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: LinqSpacing.s5,
-                ),
+                padding: const EdgeInsets.symmetric(horizontal: LinqSpacing.s5),
                 child: Column(
                   children: [
                     _RoleOptionTile(
@@ -1214,10 +1216,7 @@ class _RoleOptionTile extends StatelessWidget {
                         ),
                       ),
                       const SizedBox(height: 2),
-                      Text(
-                        subtitle,
-                        style: LinqTextStyles.bodySm,
-                      ),
+                      Text(subtitle, style: LinqTextStyles.bodySm),
                     ],
                   ),
                 ),
@@ -1252,9 +1251,263 @@ class _RoleOptionTile extends StatelessWidget {
   }
 }
 
+// ── Provider card with save/unsave bookmark ───────────────────────────────
+class _ProviderCardWidget extends StatefulWidget {
+  final Map<String, dynamic> provider;
+  const _ProviderCardWidget({required this.provider});
+
+  @override
+  State<_ProviderCardWidget> createState() => _ProviderCardWidgetState();
+}
+
+class _ProviderCardWidgetState extends State<_ProviderCardWidget> {
+  bool _saved = false;
+  bool _savingInProgress = false;
+
+  String get _ulid =>
+      (widget.provider['ulid'] ?? widget.provider['id'] ?? '').toString();
+
+  @override
+  void initState() {
+    super.initState();
+    _checkSaved();
+    AuthService.savedProvidersVersion.addListener(_checkSaved);
+  }
+
+  @override
+  void dispose() {
+    AuthService.savedProvidersVersion.removeListener(_checkSaved);
+    super.dispose();
+  }
+
+  Future<void> _checkSaved() async {
+    final saved = await AuthService.isProviderSaved(_ulid);
+    if (mounted) setState(() => _saved = saved);
+  }
+
+  Future<void> _toggleSave() async {
+    if (_savingInProgress || _ulid.isEmpty) return;
+    _savingInProgress = true;
+    final wasSaved = _saved;
+    setState(() => _saved = !wasSaved);
+
+    final result = wasSaved
+        ? await AuthService.unsaveProvider(_ulid)
+        : await AuthService.saveProvider(_ulid);
+
+    _savingInProgress = false;
+    if (!mounted) return;
+    if (result['success'] != true) {
+      setState(() => _saved = wasSaved);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(result['message']?.toString() ?? 'Something went wrong.'),
+          backgroundColor: LinqColors.danger500,
+        ),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final pro = widget.provider;
+    final imageUrl = (pro['image'] ?? '').toString().trim();
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: LinqSpacing.s5),
+      decoration: BoxDecoration(
+        color: LinqColors.bgSurface,
+        borderRadius: LinqRadius.borderLg,
+        border: Border.all(color: LinqColors.borderDefault),
+        boxShadow: LinqShadows.xs,
+      ),
+      child: Column(
+        children: [
+          Stack(
+            children: [
+              ClipRRect(
+                borderRadius: const BorderRadius.vertical(
+                  top: Radius.circular(12),
+                ),
+                child: imageUrl.isEmpty
+                    ? Container(
+                        height: 200,
+                        width: double.infinity,
+                        color: LinqColors.stone100,
+                        child: const Icon(
+                          Icons.person,
+                          size: 80,
+                          color: LinqColors.stone300,
+                        ),
+                      )
+                    : CachedNetworkImage(
+                        imageUrl: imageUrl,
+                        height: 200,
+                        width: double.infinity,
+                        fit: BoxFit.cover,
+                        errorListener: (_) {
+                          CachedNetworkImage.evictFromCache(imageUrl);
+                        },
+                        placeholder: (_, _) =>
+                            Container(height: 200, color: LinqColors.stone100),
+                        errorWidget: (_, _, _) => Container(
+                          height: 200,
+                          color: LinqColors.stone100,
+                          child: const Icon(
+                            Icons.person,
+                            size: 80,
+                            color: LinqColors.stone300,
+                          ),
+                        ),
+                      ),
+              ),
+              Positioned(top: 12, left: 12, child: linqVerifiedBadge()),
+            ],
+          ),
+          Padding(
+            padding: const EdgeInsets.all(LinqSpacing.s4),
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        pro['name'].toString(),
+                        style: LinqTextStyles.h4.copyWith(
+                          color: LinqColors.forest500,
+                        ),
+                      ),
+                    ),
+                    Row(
+                      children: [
+                        const Icon(Icons.star, size: 16, color: Colors.amber),
+                        const SizedBox(width: 2),
+                        Text(
+                          pro['rating'].toString(),
+                          style: LinqTextStyles.bodySm,
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    pro['role'].toString(),
+                    style: LinqTextStyles.bodySm.copyWith(
+                      color: LinqColors.forest400,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Text('📍 ${pro['distance']}', style: LinqTextStyles.bodySm),
+                    const SizedBox(width: 16),
+                    Text(
+                      '⏰ ${pro['availability']}',
+                      style: LinqTextStyles.bodySm,
+                    ),
+                  ],
+                ),
+                const SizedBox(height: LinqSpacing.s4),
+                Row(
+                  children: [
+                    Expanded(
+                      child: ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: LinqColors.forest500,
+                          foregroundColor: LinqColors.textOnBrand,
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                          elevation: 0,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: LinqRadius.borderMd,
+                          ),
+                        ),
+                        onPressed: () => Navigator.pushNamed(
+                          context,
+                          '/provider-profile',
+                          arguments: {
+                            'provider': pro,
+                            'showBottomNav': false,
+                          },
+                        ),
+                        child: const Text(
+                          'Profile',
+                          style: TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: LinqSpacing.s3),
+                    // Bookmark / save toggle
+                    Material(
+                      color: LinqColors.bgSurface,
+                      borderRadius: LinqRadius.borderMd,
+                      child: InkWell(
+                        borderRadius: LinqRadius.borderMd,
+                        onTap: _savingInProgress ? null : _toggleSave,
+                        child: Container(
+                          width: 44,
+                          height: 44,
+                          decoration: BoxDecoration(
+                            border: Border.all(
+                              color: _saved
+                                  ? LinqColors.forest500
+                                  : LinqColors.borderDefault,
+                            ),
+                            borderRadius: LinqRadius.borderMd,
+                          ),
+                          child: Icon(
+                            _saved
+                                ? Icons.bookmark_rounded
+                                : Icons.bookmark_border_rounded,
+                            size: 22,
+                            color: _saved
+                                ? LinqColors.forest500
+                                : LinqColors.stone400,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: LinqSpacing.s3),
+                    Expanded(
+                      child: ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: LinqColors.forest700,
+                          foregroundColor: LinqColors.textOnBrand,
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                          elevation: 0,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: LinqRadius.borderMd,
+                          ),
+                        ),
+                        onPressed: () => Navigator.pushNamed(
+                          context,
+                          '/provider-hire',
+                          arguments: pro,
+                        ),
+                        child: const Text(
+                          'Hire now',
+                          style: TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class BottomNavBar extends StatelessWidget {
   final int selectedIndex;
-  final Function(int, String) onNavigate;
+  final Function(int) onNavigate;
 
   const BottomNavBar({
     super.key,
@@ -1272,27 +1525,18 @@ class BottomNavBar extends StatelessWidget {
       type: BottomNavigationBarType.fixed,
       elevation: 0,
       onTap: (index) {
-        switch (index) {
-          case 0:
-            onNavigate(0, '/customer-dashboard');
-            break;
-          case 1:
-            onNavigate(1, '/user-jobs');
-            break;
-          case 2:
-            onNavigate(2, '/user-transactions');
-            break;
-          case 3:
-            onNavigate(3, '/user-profile');
-            break;
-        }
+        onNavigate(index);
       },
       items: const [
-        BottomNavigationBarItem(icon: Icon(Icons.explore), label: 'Discovery'),
+        BottomNavigationBarItem(icon: Icon(Icons.home_rounded), label: 'Home'),
         BottomNavigationBarItem(icon: Icon(Icons.work), label: 'Jobs'),
         BottomNavigationBarItem(
           icon: Icon(Icons.account_balance_wallet),
-          label: 'Transactions',
+          label: 'Wallet',
+        ),
+        BottomNavigationBarItem(
+          icon: Icon(Icons.bookmark_rounded),
+          label: 'Saved',
         ),
         BottomNavigationBarItem(icon: Icon(Icons.person), label: 'Profile'),
       ],

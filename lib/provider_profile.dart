@@ -6,8 +6,15 @@ import 'provider_nav_bar.dart';
 
 class ProviderProfilePage extends StatefulWidget {
   final Map<String, dynamic> provider;
+  final bool showBottomNav;
+  final bool hideHireActions;
 
-  const ProviderProfilePage({super.key, required this.provider});
+  const ProviderProfilePage({
+    super.key,
+    required this.provider,
+    this.showBottomNav = true,
+    this.hideHireActions = false,
+  });
 
   @override
   State<ProviderProfilePage> createState() => _ProviderProfilePageState();
@@ -262,12 +269,13 @@ class _ProviderProfilePageState extends State<ProviderProfilePage> {
                   ? _buildErrorState()
                   : Column(
                       children: [
+                        const SizedBox(height: LinqSpacing.s4),
                         _buildBio(),
                         const SizedBox(height: LinqSpacing.s4),
                         _buildRatingsSection(),
                         if (_reviews.isNotEmpty) _buildReviews(),
                         _buildPortfolio(),
-                        _buildHireSection(),
+                        if (!widget.hideHireActions) _buildHireSection(),
                         //_buildLogoutSection(),
                         const SizedBox(height: 100),
                       ],
@@ -276,10 +284,12 @@ class _ProviderProfilePageState extends State<ProviderProfilePage> {
           ],
         ),
       ),
-      bottomNavigationBar: ProviderNavBar(
-        selectedIndex: _selectedNavIndex,
-        onNavigate: _handleNavigation,
-      ),
+      bottomNavigationBar: widget.showBottomNav
+          ? ProviderNavBar(
+              selectedIndex: _selectedNavIndex,
+              onNavigate: _handleNavigation,
+            )
+          : null,
     );
   }
 
@@ -479,7 +489,8 @@ class _ProviderProfilePageState extends State<ProviderProfilePage> {
     }
 
     return Container(
-      margin: const EdgeInsets.all(LinqSpacing.s5),
+      width: double.infinity,
+      margin: const EdgeInsets.symmetric(horizontal: LinqSpacing.s5),
       padding: const EdgeInsets.all(LinqSpacing.s5),
       decoration: BoxDecoration(
         color: LinqColors.bgSurface,
@@ -487,13 +498,16 @@ class _ProviderProfilePageState extends State<ProviderProfilePage> {
         border: Border.all(color: LinqColors.borderDefault),
         boxShadow: LinqShadows.xs,
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text('About', style: LinqTextStyles.h3),
-          const SizedBox(height: LinqSpacing.s3),
-          Text(_bio, style: LinqTextStyles.body),
-        ],
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(minHeight: 140),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('About', style: LinqTextStyles.h3),
+            const SizedBox(height: LinqSpacing.s3),
+            Text(_bio, style: LinqTextStyles.body),
+          ],
+        ),
       ),
     );
   }
@@ -754,41 +768,129 @@ class _ProviderProfilePageState extends State<ProviderProfilePage> {
       child: Column(
         children: [
           const SizedBox(height: LinqSpacing.s5),
-          SizedBox(
-            width: double.infinity,
-            child: ElevatedButton.icon(
-              style: ElevatedButton.styleFrom(
-                backgroundColor: LinqColors.forest500,
-                foregroundColor: LinqColors.textOnBrand,
-                padding: const EdgeInsets.symmetric(vertical: 16),
-                elevation: 0,
-                shape: RoundedRectangleBorder(
-                  borderRadius: LinqRadius.borderMd,
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: LinqColors.forest100,
+                    foregroundColor: LinqColors.forest500,
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    elevation: 0,
+                    minimumSize: Size.zero,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: LinqRadius.borderMd,
+                      side: const BorderSide(color: LinqColors.forest500),
+                    ),
+                  ),
+                  onPressed: () => _openMessages(),
+                  icon: const Icon(Icons.chat_bubble_outline_rounded, size: 18),
+                  label: const Text(
+                    'Message',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
                 ),
               ),
-              onPressed: () {
-                Navigator.pushNamed(
-                  context,
-                  '/provider-hire',
-                  arguments: widget.provider,
-                );
-              },
-              icon: const Icon(Icons.handshake_outlined),
-              label: const Text(
-                'Hire now',
-                style: TextStyle(fontWeight: FontWeight.w600),
+              const SizedBox(width: LinqSpacing.s3),
+              Expanded(
+                child: ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: LinqColors.forest500,
+                    foregroundColor: LinqColors.textOnBrand,
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    elevation: 0,
+                    minimumSize: Size.zero,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: LinqRadius.borderMd,
+                    ),
+                  ),
+                  onPressed: () {
+                    Navigator.pushNamed(
+                      context,
+                      '/provider-hire',
+                      arguments: widget.provider,
+                    );
+                  },
+                  icon: const Icon(Icons.handshake_outlined, size: 18),
+                  label: const Text(
+                    'Hire now',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                ),
               ),
-            ),
+            ],
           ),
           const SizedBox(height: LinqSpacing.s4),
           Text(
             'Hire ${_name.split(' ').first} directly, or allow other providers in the same category to bid.',
-            style: LinqTextStyles.bodySm.copyWith(color: LinqColors.textSecondary),
+            style: LinqTextStyles.bodySm.copyWith(
+              color: LinqColors.textSecondary,
+            ),
             textAlign: TextAlign.center,
           ),
         ],
       ),
     );
+  }
+
+  Future<void> _openMessages() async {
+    final providerUlid = (widget.provider['ulid'] ?? widget.provider['id'] ?? '').toString();
+    if (providerUlid.isEmpty) return;
+
+    final loadingCtrl = ScaffoldMessenger.of(context);
+    loadingCtrl.showSnackBar(const SnackBar(
+      content: Text('Opening conversation…'),
+      duration: Duration(seconds: 2),
+    ));
+
+    final result = await AuthService.getOrCreateDirectThread(providerUlid);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+
+    if (result['success'] == true) {
+      final threadData = result['data'];
+      final thread = Map<String, dynamic>.from(
+        threadData is Map<String, dynamic>
+            ? threadData
+            : (threadData is Map
+                ? threadData.cast<String, dynamic>()
+                : <String, dynamic>{}),
+      );
+      // Ensure the thread carries provider identity so ChatPage can show
+      // the right name and avatar regardless of whether the API returns participants.
+      final existingParticipants = thread['participants'];
+      final hasProviderParticipant = existingParticipants is List &&
+          existingParticipants.any(
+            (p) => p is Map &&
+                (p['role'] ?? '').toString().toUpperCase() == 'PROV',
+          );
+      if (!hasProviderParticipant) {
+        thread['participants'] = [
+          {
+            'role': 'PROV',
+            'name': _name,
+            'photo_url': _image,
+            'ulid': providerUlid,
+          },
+          if (existingParticipants is List) ...existingParticipants,
+        ];
+      }
+      Navigator.pushNamed(context, '/chat', arguments: thread);
+    } else if (result['auth_required'] == true) {
+      if (AuthService.claimLoginRedirect()) {
+        await AuthService.logout();
+        if (mounted) {
+          Navigator.pushNamedAndRemoveUntil(context, '/login', (_) => false);
+        }
+      }
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(result['message']?.toString() ?? 'Unable to open conversation.'),
+        backgroundColor: LinqColors.danger500,
+      ));
+    }
   }
 
   // Widget _buildLogoutSection() {
@@ -865,7 +967,6 @@ class _ProviderProfilePageState extends State<ProviderProfilePage> {
   // Removed in favor of ProviderNavBar for consistent bottom navigation
 }
 
-
 // ── Full-screen photo viewer ────────────────────────────────────
 class _PhotoViewer extends StatefulWidget {
   final List<String> images;
@@ -920,13 +1021,13 @@ class _PhotoViewerState extends State<_PhotoViewer> {
               errorListener: (_) {
                 CachedNetworkImage.evictFromCache(widget.images[i]);
               },
-              placeholder: (_, __) => const Center(
+              placeholder: (_, _) => const Center(
                 child: CircularProgressIndicator(
                   color: LinqColors.forest500,
                   strokeWidth: 2,
                 ),
               ),
-              errorWidget: (_, __, ___) => const Icon(
+              errorWidget: (_, _, _) => const Icon(
                 Icons.image_not_supported,
                 color: Colors.white54,
                 size: 64,

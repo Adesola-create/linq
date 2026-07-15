@@ -56,7 +56,6 @@ class _ProviderJobsPageState extends State<ProviderJobsPage>
 
       // Fetch available jobs that match provider's skills
       final availableJobsResult = await AuthService.getJobs();
-      print('[ProviderJobsPage] Available jobs result: $availableJobsResult');
 
       if (availableJobsResult['success'] == true) {
         final jobsList = availableJobsResult['data'] ?? [];
@@ -73,7 +72,6 @@ class _ProviderJobsPageState extends State<ProviderJobsPage>
 
       // Fetch active jobs (jobs provider has accepted)
       final activeJobsResult = await AuthService.getProviderJobs();
-      print('[ProviderJobsPage] Active jobs result: $activeJobsResult');
 
       if (activeJobsResult['success'] == true) {
         final jobsList = activeJobsResult['data'] ?? [];
@@ -90,7 +88,6 @@ class _ProviderJobsPageState extends State<ProviderJobsPage>
         _loading = false;
       });
     } catch (e) {
-      print('[ProviderJobsPage] Error fetching jobs: $e');
       setState(() {
         _errorMessage = 'Unable to load jobs. Please try again.';
         _loading = false;

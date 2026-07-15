@@ -310,17 +310,10 @@ class _SubcategoryProviderListState extends State<_SubcategoryProviderList>
     if (result['success'] == true) {
       final raw = result['data'] as List<dynamic>;
 
-      print(
-        '[CategoryPage] subcategoryId=${widget.subcategoryId} slug=${widget.subcategorySlug} allChildSlugs=${widget.allChildSlugs}',
-      );
       if (raw.isNotEmpty) {
-        print(
-          '[CategoryPage] sample provider categories: ${raw.first['categories']}',
-        );
       }
 
       final matched = raw.where(_providerMatchesCategory).toList();
-      print('[CategoryPage] raw=${raw.length} matched=${matched.length}');
 
       setState(() {
         _providers = matched.map((p) {
@@ -600,12 +593,67 @@ class _SubcategoryProviderListState extends State<_SubcategoryProviderList>
 }
 
 // ── Provider card ────────────────────────────────────────────────
-class _ProviderCard extends StatelessWidget {
+class _ProviderCard extends StatefulWidget {
   final Map<String, dynamic> provider;
   const _ProviderCard({required this.provider});
 
   @override
+  State<_ProviderCard> createState() => _ProviderCardState();
+}
+
+class _ProviderCardState extends State<_ProviderCard> {
+  bool _saved = false;
+  bool _savingInProgress = false;
+
+  String get _ulid =>
+      (widget.provider['ulid'] ?? widget.provider['id'] ?? '').toString();
+
+  @override
+  void initState() {
+    super.initState();
+    _checkSaved();
+    AuthService.savedProvidersVersion.addListener(_checkSaved);
+  }
+
+  @override
+  void dispose() {
+    AuthService.savedProvidersVersion.removeListener(_checkSaved);
+    super.dispose();
+  }
+
+  Future<void> _checkSaved() async {
+    final saved = await AuthService.isProviderSaved(_ulid);
+    if (mounted) setState(() => _saved = saved);
+  }
+
+  Future<void> _toggleSave() async {
+    if (_savingInProgress || _ulid.isEmpty) return;
+    _savingInProgress = true;
+    final wasSaved = _saved;
+    setState(() => _saved = !wasSaved);
+
+    final result = wasSaved
+        ? await AuthService.unsaveProvider(_ulid)
+        : await AuthService.saveProvider(_ulid);
+
+    _savingInProgress = false;
+    if (!mounted) return;
+    if (result['success'] != true) {
+      setState(() => _saved = wasSaved);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            result['message']?.toString() ?? 'Something went wrong.',
+          ),
+          backgroundColor: LinqColors.danger500,
+        ),
+      );
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final provider = widget.provider;
     final isAvailable = provider['availability'] == 'Available today';
 
     return Container(
@@ -691,32 +739,63 @@ class _ProviderCard extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: LinqSpacing.s2_5),
-                ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: LinqColors.forest500,
-                  foregroundColor: LinqColors.textOnBrand,
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: LinqSpacing.s4,
-                    vertical: LinqSpacing.s2,
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Bookmark / save toggle
+                  GestureDetector(
+                    onTap: _savingInProgress ? null : _toggleSave,
+                    child: Container(
+                      width: 34,
+                      height: 34,
+                      decoration: BoxDecoration(
+                        border: Border.all(
+                          color: _saved
+                              ? LinqColors.forest500
+                              : LinqColors.borderDefault,
+                        ),
+                        borderRadius: LinqRadius.borderMd,
+                      ),
+                      child: Icon(
+                        _saved
+                            ? Icons.bookmark_rounded
+                            : Icons.bookmark_border_rounded,
+                        size: 18,
+                        color: _saved
+                            ? LinqColors.forest500
+                            : LinqColors.stone400,
+                      ),
+                    ),
                   ),
-                  elevation: 0,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: LinqRadius.borderMd,
+                  const SizedBox(width: LinqSpacing.s2),
+                  ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: LinqColors.forest500,
+                      foregroundColor: LinqColors.textOnBrand,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: LinqSpacing.s4,
+                        vertical: LinqSpacing.s2,
+                      ),
+                      elevation: 0,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: LinqRadius.borderMd,
+                      ),
+                      minimumSize: Size.zero,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                    onPressed: () => Navigator.pushNamed(
+                      context,
+                      '/provider-profile',
+                      arguments: provider,
+                    ),
+                    child: Text(
+                      'Profile',
+                      style: LinqTextStyles.labelSm.copyWith(
+                        color: LinqColors.textOnBrand,
+                      ),
+                    ),
                   ),
-                  minimumSize: Size.zero,
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                ),
-                onPressed: () => Navigator.pushNamed(
-                  context,
-                  '/provider-profile',
-                  arguments: provider,
-                ),
-                child: Text(
-                  'Profile',
-                  style: LinqTextStyles.labelSm.copyWith(
-                    color: LinqColors.textOnBrand,
-                  ),
-                ),
+                ],
               ),
             ],
           ),

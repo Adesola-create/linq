@@ -1,5 +1,6 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 // ─────────────────────────────────────────────────────────────────
@@ -411,6 +412,11 @@ ThemeData linqTheme() {
       elevation: 0,
       surfaceTintColor: Colors.transparent,
       titleTextStyle: LinqTextStyles.h3,
+      systemOverlayStyle: SystemUiOverlayStyle.dark.copyWith(
+        statusBarColor: Colors.transparent,
+        statusBarIconBrightness: Brightness.dark,
+        statusBarBrightness: Brightness.light,
+      ),
     ),
     cardTheme: CardThemeData(
       color: LinqColors.bgSurface,
@@ -496,7 +502,8 @@ ThemeData linqTheme() {
 // ── Shared input decoration factory ─────────────────────────────
 InputDecoration linqInputDecoration({
   required String label,
-  required IconData icon,
+  IconData? icon,
+  Widget? prefix,
   Widget? suffix,
   String? helper,
 }) {
@@ -505,7 +512,8 @@ InputDecoration linqInputDecoration({
     helperText: helper,
     helperStyle: LinqTextStyles.bodyXs.copyWith(color: LinqColors.textTertiary),
     labelStyle: LinqTextStyles.label.copyWith(color: LinqColors.forest500),
-    prefixIcon: Icon(icon, color: LinqColors.forest500, size: 20),
+    prefixIcon: icon != null ? Icon(icon, color: LinqColors.forest500, size: 20) : null,
+    prefix: prefix,
     suffixIcon: suffix,
     filled: true,
     fillColor: LinqColors.stone100,

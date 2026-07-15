@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'auth_service.dart';
@@ -26,19 +27,29 @@ class Transaction {
   });
 
   factory Transaction.fromJson(Map<String, dynamic> json) {
-    final typeStr = (json['type'] ?? 'payment').toString().toLowerCase();
+    // direction: 'C' = credit/deposit, 'D' = debit/payment
+    final direction = (json['direction'] ?? '').toString().toUpperCase();
+    final typeStr = (json['type'] ?? '').toString().toLowerCase();
     TransactionType type = TransactionType.payment;
-    if (typeStr.contains('deposit') || typeStr.contains('topup')) {
+    if (direction == 'C' || typeStr.contains('deposit') || typeStr.contains('topup')) {
       type = TransactionType.deposit;
     } else if (typeStr.contains('refund')) {
       type = TransactionType.refund;
     }
 
+    // amount_kobo is in kobo (1/100 naira); fall back to amount if present
+    double amount = 0.0;
+    if (json['amount_kobo'] is num) {
+      amount = (json['amount_kobo'] as num).abs() / 100.0;
+    } else if (json['amount'] is num) {
+      amount = (json['amount'] as num).toDouble().abs();
+    }
+
     return Transaction(
-      id: json['id']?.toString() ?? json['reference']?.toString() ?? '',
-      title: json['title']?.toString() ?? 'Transaction',
+      id: json['ulid']?.toString() ?? json['tx_id']?.toString() ?? json['id']?.toString() ?? json['reference']?.toString() ?? '',
+      title: json['description']?.toString() ?? json['title']?.toString() ?? 'Transaction',
       description: json['description']?.toString() ?? '',
-      amount: (json['amount'] is num) ? json['amount'].toDouble() : 0.0,
+      amount: amount,
       date: json['created_at'] != null
           ? DateTime.parse(json['created_at'].toString())
           : DateTime.now(),
@@ -48,7 +59,9 @@ class Transaction {
 }
 
 class UserTransactionsPage extends StatefulWidget {
-  const UserTransactionsPage({super.key});
+  final bool showBottomNav;
+
+  const UserTransactionsPage({super.key, this.showBottomNav = true});
 
   @override
   State<UserTransactionsPage> createState() => _UserTransactionsPageState();
@@ -97,7 +110,10 @@ class _PaystackCheckoutPageState extends State<_PaystackCheckoutPage> {
       appBar: AppBar(
         backgroundColor: LinqColors.forest500,
         foregroundColor: LinqColors.textOnBrand,
-        title: const Text('Complete payment'),
+        title: const Text(
+          'Complete payment',
+          style: TextStyle(color: Colors.white),
+        ),
         actions: [
           IconButton(
             icon: const Icon(Icons.close),
@@ -201,13 +217,21 @@ class _UserTransactionsPageState extends State<UserTransactionsPage>
     }
 
     final balanceResult = await AuthService.getWalletBalance();
-    final txResult = await AuthService.getTransactions(limit: 50, offset: 0);
+    final txResult = await AuthService.getTransactions(perPage: 50);
 
     if (!mounted) return;
 
     if (balanceResult['auth_required'] == true ||
         txResult['auth_required'] == true) {
-      Navigator.pushNamedAndRemoveUntil(context, '/login', (_) => false);
+      // Only redirect on an explicit (user-visible) load, never on a silent
+      // background refresh — IndexedStack keeps all tabs alive, so a silent
+      // refresh firing from an off-screen tab must not kick the user to login.
+      if (showSpinner && AuthService.claimLoginRedirect()) {
+        await AuthService.logout();
+        if (mounted) {
+          Navigator.pushNamedAndRemoveUntil(context, '/login', (_) => false);
+        }
+      }
       return;
     }
 
@@ -323,7 +347,6 @@ class _UserTransactionsPageState extends State<UserTransactionsPage>
             final statusResult = await AuthService.getTopupStatus(reference);
             if (!mounted) return;
             if (statusResult['success'] == true) {
-              print('[TopupStatus] $reference: ${statusResult['data']}');
               await _silentRefresh();
               return;
             }
@@ -333,8 +356,11 @@ class _UserTransactionsPageState extends State<UserTransactionsPage>
       }
     } else {
       setState(() => _loading = false);
-      if (result['auth_required'] == true) {
-        Navigator.pushNamedAndRemoveUntil(context, '/login', (_) => false);
+      if (result['auth_required'] == true && AuthService.claimLoginRedirect()) {
+        await AuthService.logout();
+        if (mounted) {
+          Navigator.pushNamedAndRemoveUntil(context, '/login', (_) => false);
+        }
         return;
       }
       if (mounted) {
@@ -575,70 +601,83 @@ class _UserTransactionsPageState extends State<UserTransactionsPage>
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: LinqColors.bgPageApp,
-      appBar: AppBar(
-        backgroundColor: LinqColors.forest500,
-        foregroundColor: LinqColors.textOnBrand,
-        elevation: 0,
-        title: Text(
-          'Transactions',
-          style: LinqTextStyles.h3.copyWith(color: LinqColors.textOnBrand),
-        ),
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: SystemUiOverlayStyle.light.copyWith(
+        statusBarColor: LinqColors.forest500,
+        statusBarIconBrightness: Brightness.light,
+        statusBarBrightness: Brightness.dark,
       ),
-      body: RefreshIndicator(
-        onRefresh: () => _loadWalletData(showSpinner: false),
-        color: LinqColors.forest500,
-        child: _loading
-            ? const Center(
-                child: CircularProgressIndicator(color: LinqColors.forest500),
-              )
-            : SingleChildScrollView(
-                physics: const AlwaysScrollableScrollPhysics(),
-                child: Column(
-                children: [
-                  if (_errorMessage != null)
-                    Container(
-                      margin: const EdgeInsets.all(LinqSpacing.s4),
-                      padding: const EdgeInsets.all(LinqSpacing.s3),
-                      decoration: BoxDecoration(
-                        color: LinqColors.danger50,
-                        borderRadius: LinqRadius.borderMd,
-                        border: Border.all(color: LinqColors.danger100),
-                      ),
-                      child: Row(
-                        children: [
-                          const Icon(
-                            Icons.error_outline,
-                            color: LinqColors.danger500,
-                            size: 18,
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              _errorMessage!,
-                              style: LinqTextStyles.bodySm.copyWith(
-                                color: LinqColors.danger700,
+      child: Scaffold(
+        backgroundColor: LinqColors.bgPageApp,
+        appBar: AppBar(
+          backgroundColor: LinqColors.forest500,
+          foregroundColor: LinqColors.textOnBrand,
+          elevation: 0,
+          surfaceTintColor: Colors.transparent,
+          systemOverlayStyle: SystemUiOverlayStyle.light.copyWith(
+            statusBarColor: LinqColors.forest500,
+            statusBarIconBrightness: Brightness.light,
+            statusBarBrightness: Brightness.dark,
+          ),
+          title: Text(
+            'Transactions',
+            style: LinqTextStyles.h3.copyWith(color: LinqColors.textOnBrand),
+          ),
+        ),
+        body: RefreshIndicator(
+          onRefresh: () => _loadWalletData(showSpinner: false),
+          color: LinqColors.forest500,
+          child: _loading
+              ? const Center(
+                  child: CircularProgressIndicator(color: LinqColors.forest500),
+                )
+              : SingleChildScrollView(
+                  physics: const AlwaysScrollableScrollPhysics(),
+                  child: Column(
+                  children: [
+                    if (_errorMessage != null)
+                      Container(
+                        margin: const EdgeInsets.all(LinqSpacing.s4),
+                        padding: const EdgeInsets.all(LinqSpacing.s3),
+                        decoration: BoxDecoration(
+                          color: LinqColors.danger50,
+                          borderRadius: LinqRadius.borderMd,
+                          border: Border.all(color: LinqColors.danger100),
+                        ),
+                        child: Row(
+                          children: [
+                            const Icon(
+                              Icons.error_outline,
+                              color: LinqColors.danger500,
+                              size: 18,
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                _errorMessage!,
+                                style: LinqTextStyles.bodySm.copyWith(
+                                  color: LinqColors.danger700,
+                                ),
                               ),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
+                    _WalletCard(
+                      balance: _walletBalance,
+                      onFund: _showFundWalletDialog,
+                      onRefresh: _loadWalletData,
+                      isLoading: _loading,
                     ),
-                  _WalletCard(
-                    balance: _walletBalance,
-                    onFund: _showFundWalletDialog,
-                    onRefresh: _loadWalletData,
-                    isLoading: _loading,
-                  ),
-                  const SizedBox(height: LinqSpacing.s5),
-                  _TransactionHistory(transactions: _transactions),
-                  const SizedBox(height: 80),
-                ],
+                    const SizedBox(height: LinqSpacing.s5),
+                    _TransactionHistory(transactions: _transactions),
+                    const SizedBox(height: 80),
+                  ],
+                ),
               ),
-            ),
-        ),
-      bottomNavigationBar: const _BottomNav(),
+          ),
+        bottomNavigationBar: widget.showBottomNav ? const _BottomNav() : null,
+      ),
     );
   }
 }
@@ -879,7 +918,7 @@ class _BottomNav extends StatelessWidget {
         }
       },
       items: const [
-        BottomNavigationBarItem(icon: Icon(Icons.explore), label: 'Discovery'),
+        BottomNavigationBarItem(icon: Icon(Icons.home_rounded), label: 'Home'),
         BottomNavigationBarItem(icon: Icon(Icons.work), label: 'Jobs'),
         BottomNavigationBarItem(
           icon: Icon(Icons.account_balance_wallet),

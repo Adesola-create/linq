@@ -1,7 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:geocoding/geocoding.dart';
 import 'auth_service.dart';
+import 'countries_data.dart';
 import 'job_review_page.dart';
 import 'location_service.dart';
+import 'nigeria_lga_data.dart';
 import 'linq_theme.dart';
 
 enum JobStatus { draft, open, inProgress, completed, cancelled }
@@ -98,7 +102,6 @@ class UserJob {
     final rawStatus = (json['state'] ?? json['status'] ?? json['job_status'] ?? '')
         .toString()
         .toLowerCase();
-    print('[UserJob] id=${json['ulid'] ?? json['id']} state="${json['state']}" rawStatus="$rawStatus"');
     final bool isPosted =
         json['is_posted'] == true ||
         rawStatus == 'published' ||
@@ -125,7 +128,9 @@ class UserJob {
 }
 
 class UserJobsPage extends StatefulWidget {
-  const UserJobsPage({super.key});
+  final bool showBottomNav;
+
+  const UserJobsPage({super.key, this.showBottomNav = true});
 
   @override
   State<UserJobsPage> createState() => _UserJobsPageState();
@@ -143,22 +148,20 @@ class _UserJobsPageState extends State<UserJobsPage>
   void initState() {
     super.initState();
     _tabs = TabController(length: 2, vsync: this);
-    _fetchJobs(forceRefresh: true);
+    // Initial background load — don't redirect to login even if auth fails,
+    // because this tab may not be visible yet (IndexedStack loads all tabs at once).
+    _fetchJobs(forceRefresh: false, redirectOnAuthError: false);
   }
 
-  Future<void> _fetchJobs({bool forceRefresh = false}) async {
-    print('[UserJobsPage] _fetchJobs forceRefresh=$forceRefresh');
+  Future<void> _fetchJobs({bool forceRefresh = false, bool redirectOnAuthError = true}) async {
     final result = await AuthService.getCustomerJobs(
       forceRefresh: forceRefresh,
     );
-    print('[UserJobsPage] _fetchJobs result: success=${result["success"]} fromCache=${result["fromCache"]}');
     if (!mounted) return;
     if (result['success'] == true) {
       final rawList = result['data'] as List<dynamic>;
-      print('[UserJobsPage] raw jobs count: ${rawList.length}');
       for (final item in rawList) {
         if (item is Map) {
-          print('[UserJobsPage] job id=${item["ulid"] ?? item["id"]} state="${item["state"]}" status="${item["status"]}" is_posted=${item["is_posted"]}');
         }
       }
       final rawJobs = rawList
@@ -171,9 +174,12 @@ class _UserJobsPageState extends State<UserJobsPage>
       });
     } else {
       final message = result['message']?.toString() ?? 'Failed to load jobs.';
-      if (message.contains('Authentication required') ||
-          message.contains('log in')) {
-        // Token is invalid/expired, redirect to login
+      if (redirectOnAuthError &&
+          (result['auth_required'] == true ||
+              message.contains('Authentication required') ||
+              message.contains('log in')) &&
+          AuthService.claimLoginRedirect()) {
+        await AuthService.logout();
         if (!mounted) return;
         Navigator.pushNamedAndRemoveUntil(context, '/login', (_) => false);
         return;
@@ -193,14 +199,26 @@ class _UserJobsPageState extends State<UserJobsPage>
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: LinqColors.bgPageApp,
-      appBar: AppBar(
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: SystemUiOverlayStyle.light.copyWith(
+        statusBarColor: LinqColors.forest500,
+        statusBarIconBrightness: Brightness.light,
+        statusBarBrightness: Brightness.dark,
+      ),
+      child: Scaffold(
+        backgroundColor: LinqColors.bgPageApp,
+        appBar: AppBar(
         backgroundColor: LinqColors.forest500,
         foregroundColor: LinqColors.textOnBrand,
         elevation: 0,
+        surfaceTintColor: Colors.transparent,
+        systemOverlayStyle: SystemUiOverlayStyle.light.copyWith(
+          statusBarColor: LinqColors.forest500,
+          statusBarIconBrightness: Brightness.light,
+          statusBarBrightness: Brightness.dark,
+        ),
         title: Text(
-          'My jobs',
+          'Jobs',
           style: LinqTextStyles.h3.copyWith(color: LinqColors.textOnBrand),
         ),
         bottom: TabBar(
@@ -227,8 +245,8 @@ class _UserJobsPageState extends State<UserJobsPage>
           const _PostJobTab(),
         ],
       ),
-      bottomNavigationBar: const _BottomNav(),
-    );
+      bottomNavigationBar: widget.showBottomNav ? const _BottomNav() : null,
+    ),);
   }
 }
 
@@ -476,11 +494,17 @@ class _PostJobTabState extends State<_PostJobTab> {
   final _descCtrl = TextEditingController();
   final _budgetCtrl = TextEditingController();
   final _addressCtrl = TextEditingController();
+  final _areaCtrl = TextEditingController();
+  String? _selectedManualState;
+  String? _selectedManualLga;
   DateTime? _preferredDate;
   final List<String> _selectedCategories = [];
   bool _saving = false;
   bool _useManualLocation = false;
   String? _currentLocationAddress;
+  String? _currentLocationState;
+  String? _currentLocationLga;
+  String? _currentLocationArea;
   List<Map<String, dynamic>> _availableCategories = [];
   bool _categoriesLoading = true;
 
@@ -489,17 +513,86 @@ class _PostJobTabState extends State<_PostJobTab> {
     super.initState();
     _loadCurrentLocation();
     _loadCategories();
+    _offerDraftRestore();
+  }
+
+  Future<void> _offerDraftRestore() async {
+    final draft = await AuthService.getPendingCustomerJobDraft(
+      email: await AuthService.getCurrentAccountEmail(),
+    );
+    if (draft == null || !mounted) return;
+
+    final restore = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Unsaved job draft found'),
+        content: const Text(
+          'We found a pending job post from your previous session. Restore it now?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('No'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Restore'),
+          ),
+        ],
+      ),
+    );
+
+    if (restore != true || !mounted) return;
+
+    setState(() {
+      _titleCtrl.text = draft['title']?.toString() ?? '';
+      _descCtrl.text = draft['description']?.toString() ?? '';
+      _budgetCtrl.text = draft['budget']?.toString() ?? '';
+      _addressCtrl.text = draft['location_address']?.toString() ?? draft['address_text']?.toString() ?? '';
+      _preferredDate = draft['preferred_date'] != null
+          ? DateTime.tryParse(draft['preferred_date'].toString())
+          : null;
+      _selectedCategories
+        ..clear()
+        ..addAll((draft['categories'] is List)
+            ? (draft['categories'] as List).map((item) => item.toString())
+            : const []);
+      _useManualLocation = draft['use_manual_location'] == true;
+      _currentLocationAddress = draft['current_location_address']?.toString() ?? _currentLocationAddress;
+      _selectedManualState = draft['manual_state']?.toString();
+      _selectedManualLga = draft['manual_lga']?.toString();
+      _areaCtrl.text = draft['manual_area']?.toString() ?? '';
+    });
   }
 
   Future<void> _loadCurrentLocation() async {
-    final cachedLocation = await LocationService.getCachedLocation();
-    if (cachedLocation != null) {
-      // For demo purposes, we'll use a placeholder address
-      // In a real app, you'd reverse geocode the coordinates
-      setState(
-        () => _currentLocationAddress = 'Current Location (Auto-detected)',
-      );
+    Map<String, dynamic>? location = await LocationService.getCachedLocation();
+    if (location == null) {
+      final fetched = await LocationService.fetchLocation();
+      if (fetched['success'] == true) location = fetched;
     }
+    if (location == null || !mounted) return;
+    setState(() {
+      _currentLocationState = location!['state'] as String?;
+      _currentLocationLga = location['lga'] as String?;
+      _currentLocationArea = location['area'] as String?;
+      _currentLocationAddress = _composeLocationLabel(
+        area: _currentLocationArea,
+        lga: _currentLocationLga,
+        state: _currentLocationState,
+      );
+    });
+  }
+
+  /// Joins area/LGA/state into a single human-readable label, e.g.
+  /// "Ikeja, Ikeja LGA, Lagos". Falls back to a generic label if reverse
+  /// geocoding didn't return any of these.
+  String _composeLocationLabel({String? area, String? lga, String? state}) {
+    final parts = [area, lga, state]
+        .where((p) => p != null && p.trim().isNotEmpty)
+        .map((p) => p!.trim())
+        .toList();
+    return parts.isEmpty ? 'Current Location (Auto-detected)' : parts.join(', ');
   }
 
   Future<void> _loadCategories() async {
@@ -634,18 +727,18 @@ class _PostJobTabState extends State<_PostJobTab> {
     String? addressText;
 
     if (_useManualLocation) {
-      // Manual location - validate address exists on map
-      addressText = _addressCtrl.text.trim();
+      final landmark = _addressCtrl.text.trim();
+      final area = _areaCtrl.text.trim();
+      final lga = _selectedManualLga ?? '';
+      final state = _selectedManualState ?? '';
 
-      // Basic geocoding validation - in a real app, you'd call a geocoding service
-      // For now, we'll just ensure it's a reasonable address length
-      if (addressText.length < 5) {
+      if (state.isEmpty || lga.isEmpty || area.isEmpty) {
         if (!mounted) return;
         setState(() => _saving = false);
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              'Please enter a valid address that can be found on the map.',
+              'Please select the state and enter the LGA and area/city/town.',
               style: LinqTextStyles.bodySm.copyWith(
                 color: LinqColors.textOnBrand,
               ),
@@ -658,12 +751,28 @@ class _PostJobTabState extends State<_PostJobTab> {
         return;
       }
 
-      // For manual addresses, we'd typically geocode them here
-      // For demo purposes, we'll use a placeholder location
+      addressText = [
+        if (landmark.isNotEmpty) landmark,
+        area,
+        '$lga LGA',
+        '$state State',
+      ].join(', ');
+
+      // Default to a fallback Lagos coordinate, then try to refine it by
+      // geocoding the entered address.
       locationCoords = {
         'lat': 6.5244,
         'lng': 3.3792,
-      }; // Lagos coordinates as example
+      };
+      try {
+        final results = await locationFromAddress(addressText);
+        if (results.isNotEmpty) {
+          locationCoords = {
+            'lat': results.first.latitude,
+            'lng': results.first.longitude,
+          };
+        }
+      } catch (_) {}
     } else {
       // Automatic location
       final cachedLocation = await LocationService.getCachedLocation();
@@ -732,11 +841,20 @@ class _PostJobTabState extends State<_PostJobTab> {
 
     final categorySlug = _getCategorySlug(_selectedCategories.first);
 
-    print('[UserJobsPage] Selected categories: $_selectedCategories');
-    print(
-      '[UserJobsPage] First category: ${_selectedCategories.first}',
-    );
-    print('[UserJobsPage] Category slug: $categorySlug');
+
+    final pendingDraft = {
+      'title': _titleCtrl.text.trim(),
+      'description': _descCtrl.text.trim(),
+      'budget': _budgetCtrl.text.trim(),
+      'address': _addressCtrl.text.trim(),
+      'preferred_date': _preferredDate?.toIso8601String(),
+      'categories': _selectedCategories,
+      'use_manual_location': _useManualLocation,
+      'current_location_address': _currentLocationAddress,
+      'manual_state': _selectedManualState,
+      'manual_lga': _selectedManualLga,
+      'manual_area': _areaCtrl.text.trim(),
+    };
 
     final result = await AuthService.createJobDraft(
       title: _titleCtrl.text.trim(),
@@ -747,7 +865,7 @@ class _PostJobTabState extends State<_PostJobTab> {
       budget: budgetValue,
       budgetMode: budgetValue != null ? 'fixed' : null,
       budgetMinKobo: budgetMinKobo,
-      locationLat: locationCoords['lat'],
+      locationLat: locationCoords!['lat'],
       locationLng: locationCoords['lng'],
       locationAddressText: addressText,
     );
@@ -756,6 +874,7 @@ class _PostJobTabState extends State<_PostJobTab> {
     setState(() => _saving = false);
 
     if (result['success'] == true) {
+      await AuthService.clearPendingCustomerJobDraft();
       final jobData = Map<String, dynamic>.from(
         result['data'] as Map<String, dynamic>,
       );
@@ -769,12 +888,11 @@ class _PostJobTabState extends State<_PostJobTab> {
         if (_preferredDate != null)
           'preferred_date': _preferredDate!.toIso8601String(),
         if (budgetValue != null) 'budget': budgetValue,
-        if (locationCoords != null)
-          'location': {
-            'lat': locationCoords['lat'],
-            'lng': locationCoords['lng'],
-            'address_text': addressText,
-          },
+        'location': {
+          'lat': locationCoords['lat'],
+          'lng': locationCoords['lng'],
+          'address_text': addressText,
+        },
       };
 
       Navigator.push(
@@ -789,10 +907,13 @@ class _PostJobTabState extends State<_PostJobTab> {
           _descCtrl.clear();
           _budgetCtrl.clear();
           _addressCtrl.clear();
+          _areaCtrl.clear();
           setState(() {
             _selectedCategories.clear();
             _preferredDate = null;
             _useManualLocation = false;
+            _selectedManualState = null;
+            _selectedManualLga = null;
           });
         }
       });
@@ -801,6 +922,7 @@ class _PostJobTabState extends State<_PostJobTab> {
           result['message']?.toString() ?? 'Failed to save job draft.';
       if (message.contains('Authentication required') ||
           message.contains('log in')) {
+        await AuthService.savePendingCustomerJobDraft(pendingDraft);
         if (!mounted) return;
         Navigator.pushNamedAndRemoveUntil(context, '/login', (_) => false);
         return;
@@ -964,23 +1086,59 @@ class _PostJobTabState extends State<_PostJobTab> {
                 ),
               ),
             ] else ...[
+              DropdownButtonFormField<String>(
+                value: _selectedManualState,
+                decoration: linqInputDecoration(
+                  label: 'State',
+                  icon: Icons.map_outlined,
+                ),
+                isExpanded: true,
+                items: (countriesAndStates['Nigeria'] ?? [])
+                    .map((s) => DropdownMenuItem(value: s, child: Text(s)))
+                    .toList(),
+                onChanged: (val) => setState(() {
+                  _selectedManualState = val;
+                  _selectedManualLga = null;
+                }),
+                validator: (v) =>
+                    v == null || v.isEmpty ? 'Select a state' : null,
+              ),
+              const SizedBox(height: LinqSpacing.s4),
+              DropdownButtonFormField<String>(
+                value: _selectedManualLga,
+                decoration: linqInputDecoration(
+                  label: 'Local Government Area (LGA)',
+                  icon: Icons.location_city_outlined,
+                ),
+                isExpanded: true,
+                items: (nigeriaLgasByState[_selectedManualState] ?? [])
+                    .map((l) => DropdownMenuItem(value: l, child: Text(l)))
+                    .toList(),
+                onChanged: _selectedManualState == null
+                    ? null
+                    : (val) => setState(() => _selectedManualLga = val),
+                validator: (v) =>
+                    v == null || v.isEmpty ? 'Select an LGA' : null,
+              ),
+              const SizedBox(height: LinqSpacing.s4),
+              TextFormField(
+                controller: _areaCtrl,
+                decoration: linqInputDecoration(
+                  label: 'Area / City / Town',
+                  icon: Icons.location_on_outlined,
+                ),
+                validator: (v) => v == null || v.trim().isEmpty
+                    ? 'Area/city/town is required'
+                    : null,
+              ),
+              const SizedBox(height: LinqSpacing.s4),
               TextFormField(
                 controller: _addressCtrl,
                 maxLines: 2,
                 decoration: linqInputDecoration(
-                  label: 'Enter job address or landmark (must exist on map)',
-                  icon: Icons.location_on_outlined,
+                  label: 'Street address or landmark (optional)',
+                  icon: Icons.signpost_outlined,
                 ),
-                validator: (v) {
-                  if (v == null || v.trim().isEmpty) {
-                    return 'Location address is required';
-                  }
-                  // Basic validation - in a real app, you'd geocode here
-                  if (v.trim().length < 5) {
-                    return 'Please enter a valid address';
-                  }
-                  return null;
-                },
               ),
               const SizedBox(height: LinqSpacing.s2),
               Row(
@@ -1040,7 +1198,7 @@ class _PostJobTabState extends State<_PostJobTab> {
             ),
             const SizedBox(height: LinqSpacing.s4),
 
-            _label('Budget (optional)'),
+            _label('Budget'),
             TextFormField(
               controller: _budgetCtrl,
               keyboardType: TextInputType.number,
@@ -1073,7 +1231,7 @@ class _PostJobTabState extends State<_PostJobTab> {
                       )
                     : const Icon(Icons.send),
                 label: Text(
-                  _saving ? 'Saving draft...' : 'Save & review',
+                  _saving ? 'Saving draft...' : 'Continue',
                   style: const TextStyle(
                     fontSize: 16,
                     fontWeight: FontWeight.w600,
@@ -1123,11 +1281,11 @@ class _BottomNav extends StatelessWidget {
         }
       },
       items: const [
-        BottomNavigationBarItem(icon: Icon(Icons.explore), label: 'Discovery'),
+        BottomNavigationBarItem(icon: Icon(Icons.home_rounded), label: 'Home'),
         BottomNavigationBarItem(icon: Icon(Icons.work), label: 'Jobs'),
         BottomNavigationBarItem(
           icon: Icon(Icons.account_balance_wallet),
-          label: 'Transactions',
+          label: 'Wallet',
         ),
         BottomNavigationBarItem(icon: Icon(Icons.person), label: 'Profile'),
       ],

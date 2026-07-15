@@ -161,6 +161,9 @@ class _ActiveJobDetailsScreenState extends State<ActiveJobDetailsScreen> {
       appBar: AppBar(
         backgroundColor: LinqColors.forest500,
         foregroundColor: LinqColors.textOnBrand,
+        titleTextStyle: LinqTextStyles.h3.copyWith(
+          color: LinqColors.textOnBrand,
+        ),
         title: Text(title.isNotEmpty ? title : 'Job Details'),
         leading: IconButton(
           icon: const Icon(Icons.arrow_back),

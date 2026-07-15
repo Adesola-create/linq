@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'auth_service.dart';
 import 'linq_theme.dart';
 
 class CompleteProfilePage extends StatelessWidget {
@@ -127,8 +128,12 @@ class CompleteProfilePage extends StatelessWidget {
                       width: double.infinity,
                       child: ElevatedButton(
                         style: linqPrimaryButton(verticalPadding: LinqSpacing.s4),
-                        onPressed: () =>
-                            Navigator.pushNamed(context, '/customer-dashboard'),
+                        onPressed: () async {
+                          await AuthService.markProfileSetupComplete();
+                          if (!context.mounted) return;
+                          Navigator.pushNamedAndRemoveUntil(
+                              context, '/customer-dashboard', (_) => false);
+                        },
                         child: const Text('Complete setup',
                             style: TextStyle(
                                 fontWeight: FontWeight.w600, fontSize: 16)),

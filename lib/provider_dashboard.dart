@@ -28,7 +28,6 @@ class _ProviderDashboardScreenState extends State<ProviderDashboardScreen> {
 
   Future<void> _loadActiveRole() async {
     final role = await AuthService.getActiveRole();
-    print('[ProviderDashboard] Loaded active role: $role');
     if (mounted) {
       setState(() {
         _activeRole = role ?? 'provider';
@@ -39,18 +38,13 @@ class _ProviderDashboardScreenState extends State<ProviderDashboardScreen> {
 
   Future<void> _loadCurrentProviderData() async {
     try {
-      final profile = await AuthService.getProfile();
-      print('[ProviderDashboard] Profile fetch result: ${profile['success']}');
+      final profile = await AuthService.getProviderAccountProfile();
       if (profile['success'] == true && mounted) {
         setState(() {
           _currentProviderData = profile['data'] ?? {};
-          print(
-            '[ProviderDashboard] Loaded provider data: ${_currentProviderData.keys}',
-          );
         });
       }
     } catch (e) {
-      print('[ProviderDashboard] Error loading provider data: $e');
     }
   }
 
@@ -80,7 +74,6 @@ class _ProviderDashboardScreenState extends State<ProviderDashboardScreen> {
       _switchingRole = true;
     });
 
-    print('[ProviderDashboard] Switching role from $_activeRole to $newRole');
 
     try {
       final result = await AuthService.switchRole(newRole);
@@ -88,7 +81,6 @@ class _ProviderDashboardScreenState extends State<ProviderDashboardScreen> {
       if (!mounted) return;
 
       if (result['success'] == true) {
-        print('[ProviderDashboard] Role switch successful');
         setState(() {
           _activeRole = newRole;
           _selectedNavIndex = 0; // Reset nav index on role switch
@@ -96,19 +88,11 @@ class _ProviderDashboardScreenState extends State<ProviderDashboardScreen> {
 
         // If switching to provider, check if provider account is set up
         if (newRole == 'provider') {
-          final profileResult = await AuthService.getProfile(forceRefresh: true);
-          
+          final profileResult = await AuthService.getProviderAccountProfile(forceRefresh: true);
+
           if (profileResult['success'] == true) {
             final profileData = profileResult['data'] as Map<String, dynamic>?;
-            final businessName = profileData?['business_name'] ?? 
-                                profileData?['provider_name'] ??
-                                profileData?['company_name'];
-            final businessId = profileData?['business_id'] ??
-                              profileData?['provider_id'];
-
-            // If provider account is not set up, redirect to setup page
-            if (businessName == null || businessId == null) {
-              print('[ProviderDashboard] Provider account not set up - redirecting to setup');
+            if (!AuthService.hasProviderAccountProfileData(profileData)) {
               if (mounted) {
                 Navigator.pushNamedAndRemoveUntil(
                   context,
@@ -118,6 +102,15 @@ class _ProviderDashboardScreenState extends State<ProviderDashboardScreen> {
               }
               return;
             }
+          } else if (profileResult['statusCode'] == 404) {
+            if (mounted) {
+              Navigator.pushNamedAndRemoveUntil(
+                context,
+                '/provider-setup',
+                (route) => false,
+              );
+            }
+            return;
           }
         }
 
@@ -125,20 +118,67 @@ class _ProviderDashboardScreenState extends State<ProviderDashboardScreen> {
             ? '/provider-dashboard'
             : '/customer-dashboard';
 
-        print('[ProviderDashboard] Navigating to: $targetRoute');
 
         Navigator.pushNamedAndRemoveUntil(context, targetRoute, (route) {
-          print('[ProviderDashboard] Removing route: ${route.settings.name}');
           return false;
         });
       } else {
-        print('[ProviderDashboard] Role switch failed: ${result['message']}');
+
+        final status = result['statusCode'] is int ? result['statusCode'] as int : null;
+        if (status == 409) {
+          // Account already linked for that role. If we have customer data cached, navigate there.
+          final cached = await AuthService.getCachedProfile();
+          var hasCustomer = false;
+          if (cached != null) {
+            if (cached['role'] is String && cached['role'] == 'customer') hasCustomer = true;
+            if (!hasCustomer && cached['user'] is Map) {
+              final user = cached['user'] as Map<String, dynamic>;
+              if (user['role'] is String && user['role'] == 'customer') hasCustomer = true;
+            }
+          }
+
+          if (hasCustomer) {
+            // Persist the role change even though the switch endpoint returned 409
+            await AuthService.setActiveRole('customer');
+            if (!mounted) return;
+            setState(() {
+              _activeRole = 'customer';
+            });
+            Navigator.pushNamedAndRemoveUntil(
+              context,
+              '/customer-dashboard',
+              (route) => false,
+            );
+            return;
+          } else {
+            // Show dialog informing the user their account is already linked
+            if (mounted) {
+              showDialog(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('Account Linked'),
+                  content: Text(result['message']?.toString() ?? 'An account is already linked for that role.'),
+                  actions: [
+                    TextButton(
+                      onPressed: () {
+                        Navigator.of(ctx).pop();
+                        setState(() { _switchingRole = false; });
+                      },
+                      child: const Text('OK'),
+                    ),
+                  ],
+                ),
+              );
+              return;
+            }
+          }
+        }
+
         setState(() {
           _switchingRole = false;
         });
       }
     } catch (error) {
-      print('[ProviderDashboard] Role switch error: $error');
       if (mounted) {
         setState(() {
           _switchingRole = false;
@@ -172,7 +212,6 @@ class _ProviderDashboardScreenState extends State<ProviderDashboardScreen> {
       if (!mounted) return;
       Navigator.pushNamedAndRemoveUntil(context, '/login', (route) => false);
     } catch (e) {
-      print('[ProviderDashboard] Logout error: $e');
       if (mounted) {
         setState(() {
           _switchingRole = false;
@@ -207,9 +246,6 @@ class _ProviderDashboardScreenState extends State<ProviderDashboardScreen> {
   }
   @override
   Widget build(BuildContext context) {
-    print(
-      '[ProviderDashboard] Building widget - role: $_activeRole, navIndex: $_selectedNavIndex',
-    );
 
     if (_roleLoading) {
       return Scaffold(
@@ -240,6 +276,24 @@ class _ProviderDashboardScreenState extends State<ProviderDashboardScreen> {
                     onToggleOnline: _toggleOnlineStatus,
                     onNotificationsTap: () {},
                     onLogoutTap: _handleLogout,
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: LinqSpacing.s5,
+                      vertical: LinqSpacing.s4,
+                    ),
+                    child: SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton(
+                        onPressed: () {
+                          Navigator.pushNamed(context, '/provider-setup');
+                        },
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: LinqColors.forest500,
+                        ),
+                        child: const Text('Open provider setup (temp)'),
+                      ),
+                    ),
                   ),
                   Expanded(
                     child: SingleChildScrollView(
@@ -334,61 +388,61 @@ class DashboardTopBar extends StatelessWidget {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          GestureDetector(
-            onTap: onRoleMenuTap,
-            child: Container(
-              padding: const EdgeInsets.symmetric(
-                horizontal: LinqSpacing.s3,
-                vertical: LinqSpacing.s2,
-              ),
-              decoration: BoxDecoration(
-                color: LinqColors.forest50,
-                border: Border.all(color: LinqColors.forest200),
-                borderRadius: BorderRadius.circular(20),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Container(
-                    width: 28,
-                    height: 28,
-                    decoration: const BoxDecoration(
-                      color: LinqColors.forest500,
-                      shape: BoxShape.circle,
-                    ),
-                    child: const Icon(
-                      Icons.person,
-                      color: LinqColors.textOnBrand,
-                      size: 16,
-                    ),
-                  ),
-                  const SizedBox(width: LinqSpacing.s2),
-                  Text(
-                    roleDisplay,
-                    style: LinqTextStyles.label.copyWith(
-                      color: LinqColors.forest500,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  const SizedBox(width: LinqSpacing.s1),
-                  const Icon(
-                    Icons.keyboard_arrow_down_rounded,
-                    color: LinqColors.forest500,
-                    size: 18,
-                  ),
-                ],
-              ),
+          Text(
+            'LINQ',
+            style: LinqTextStyles.h4.copyWith(
+              color: LinqColors.forest500,
+              letterSpacing: 2,
+              fontWeight: FontWeight.w900,
             ),
           ),
           Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Text(
-                'LINQ',
-                style: LinqTextStyles.h4.copyWith(
-                  color: LinqColors.forest500,
-                  letterSpacing: 2,
-                  fontWeight: FontWeight.w900,
+              GestureDetector(
+                onTap: onRoleMenuTap,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: LinqSpacing.s3,
+                    vertical: LinqSpacing.s2,
+                  ),
+                  decoration: BoxDecoration(
+                    color: LinqColors.forest50,
+                    border: Border.all(color: LinqColors.forest200),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        width: 28,
+                        height: 28,
+                        decoration: const BoxDecoration(
+                          color: LinqColors.forest500,
+                          shape: BoxShape.circle,
+                        ),
+                        child: const Icon(
+                          Icons.person,
+                          color: LinqColors.textOnBrand,
+                          size: 16,
+                        ),
+                      ),
+                      const SizedBox(width: LinqSpacing.s2),
+                      Text(
+                        roleDisplay,
+                        style: LinqTextStyles.label.copyWith(
+                          color: LinqColors.forest500,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(width: LinqSpacing.s1),
+                      const Icon(
+                        Icons.keyboard_arrow_down_rounded,
+                        color: LinqColors.forest500,
+                        size: 18,
+                      ),
+                    ],
+                  ),
                 ),
               ),
               const SizedBox(width: LinqSpacing.s3),

@@ -1,5 +1,6 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'auth_service.dart';
 import 'linq_theme.dart';
 
@@ -21,16 +22,28 @@ class _SplashScreenState extends State<SplashScreen> {
     await Future.delayed(const Duration(milliseconds: 800));
     if (!mounted) return;
     final token = await AuthService.getToken();
-    print('[SplashScreen] Token: ${token != null ? '[REDACTED]' : 'null'}');
     if (token == null || token.isEmpty) {
       if (!mounted) return;
       Navigator.pushReplacementNamed(context, '/login');
       return;
     }
 
-    // Use active role (current operating role) for routing
-    final activeRole = await AuthService.getActiveRole();
-    print('[SplashScreen] Active role: $activeRole');
+    final currentEmail = await AuthService.getCurrentAccountEmail();
+    final pendingInterruptedRoute = await AuthService.getPendingInterruptedRoute(
+      email: currentEmail,
+    );
+    final interruptedRoute = pendingInterruptedRoute?['route']?.toString();
+    if (interruptedRoute != null && interruptedRoute.isNotEmpty) {
+      await AuthService.clearPendingInterruptedRoute();
+      if (!mounted) return;
+      Navigator.pushReplacementNamed(context, interruptedRoute);
+      return;
+    }
+
+    // Determine effective role with clear precedence:
+    // 1) email-scoped last-mode, 2) active role, 3) backend/cache fallback, 4) default to customer
+    final activeRoleRaw = await AuthService.getActiveRole();
+    final activeRole = activeRoleRaw?.toString().toLowerCase();
     final cachedProfile = await AuthService.getCachedProfile();
     final fallbackRole =
         (cachedProfile != null
@@ -41,22 +54,82 @@ class _SplashScreenState extends State<SplashScreen> {
             ?.toString()
             .toLowerCase();
 
-    final effectiveRole = (activeRole != null && activeRole.isNotEmpty)
+    final scopedLastModeRaw = await AuthService.getLastAccountMode(email: currentEmail);
+    final scopedLastMode = scopedLastModeRaw?.toString().toLowerCase();
+    final effectiveRole = (scopedLastMode != null && scopedLastMode.isNotEmpty)
+      ? scopedLastMode
+      : (activeRole != null && activeRole.isNotEmpty)
         ? activeRole
         : (fallbackRole == 'provider' ? 'provider' : 'customer');
 
-    print('[SplashScreen] Effective role: $effectiveRole');
     if (!mounted) return;
-    final route = effectiveRole == 'provider'
-        ? '/provider-dashboard'
-        : '/customer-dashboard';
-    Navigator.pushReplacementNamed(context, route);
+    
+    if (effectiveRole == 'provider') {
+      // Check if provider account is set up
+      final profileResult = await AuthService.getProviderAccountProfile();
+      if (profileResult['success'] == true) {
+        final profileData = profileResult['data'] as Map<String, dynamic>?;
+        if (!AuthService.hasProviderAccountProfileData(profileData)) {
+          if (!mounted) return;
+          Navigator.pushReplacementNamed(context, '/provider-setup');
+          return;
+        }
+      } else if (profileResult['statusCode'] == 404) {
+        // No provider profile found - redirect to setup
+        if (!mounted) return;
+        Navigator.pushReplacementNamed(context, '/provider-setup');
+        return;
+      }
+      Navigator.pushReplacementNamed(context, '/provider-dashboard');
+      return;
+    }
+    
+    // For customers: check if profile has essential data from backend
+    final profileResult = await AuthService.getProfile();
+    if (profileResult['success'] == true) {
+      final profileData = profileResult['data'] as Map<String, dynamic>?;
+      // Extract user data from nested structure
+      final userData = profileData?['user'] as Map<String, dynamic>? ?? profileData;
+      
+      // Check if essential profile fields exist (name, phone, etc.)
+      final hasName = (userData?['first_name']?.toString().trim().isNotEmpty ?? false) ||
+                      (userData?['name']?.toString().trim().isNotEmpty ?? false) ||
+                      (userData?['full_name']?.toString().trim().isNotEmpty ?? false);
+      final hasPhone = userData?['phone']?.toString().trim().isNotEmpty ?? false;
+      
+      // If profile has essential data, mark as complete and go to dashboard
+      if (hasName && hasPhone) {
+        await AuthService.markProfileSetupComplete();
+        if (!mounted) return;
+        Navigator.pushReplacementNamed(context, '/customer-dashboard');
+        return;
+      }
+    }
+    
+    // Check local flag as fallback
+    final setupDone = await AuthService.hasCompletedProfileSetup();
+    if (setupDone) {
+      Navigator.pushReplacementNamed(context, '/customer-dashboard');
+      return;
+    }
+
+    // Profile setup page is not needed for customer accounts.
+    // Navigator.pushReplacementNamed(context, '/complete-profile');
+    await AuthService.markProfileSetupComplete();
+    if (!mounted) return;
+    Navigator.pushReplacementNamed(context, '/customer-dashboard');
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: Stack(
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: SystemUiOverlayStyle.light.copyWith(
+        statusBarColor: Colors.transparent,
+        statusBarIconBrightness: Brightness.light,
+        statusBarBrightness: Brightness.dark,
+      ),
+      child: Scaffold(
+        body: Stack(
         children: [
           /// Background Gradient
           Container(color: LinqColors.forest500),
@@ -78,12 +151,25 @@ class _SplashScreenState extends State<SplashScreen> {
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      Text(
-                        'LINQ',
-                        style: LinqTextStyles.h1.copyWith(
-                          color: LinqColors.textOnBrand,
-                          letterSpacing: 2,
-                        ),
+                      Row(
+                        children: [
+                          ClipOval(
+                            child: Image.asset(
+                              'assets/icon/app_icon.jpeg',
+                              width: 36,
+                              height: 36,
+                              fit: BoxFit.cover,
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Text(
+                            'LINQ',
+                            style: LinqTextStyles.h1.copyWith(
+                              color: LinqColors.textOnBrand,
+                              letterSpacing: 2,
+                            ),
+                          ),
+                        ],
                       ),
                       // TextButton(
                       //   onPressed: () {
@@ -178,7 +264,7 @@ class _SplashScreenState extends State<SplashScreen> {
           // ),
         ],
       ),
-    );
+    ));
   }
 
   Widget _leftContent(BuildContext context) {

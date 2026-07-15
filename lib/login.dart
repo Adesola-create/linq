@@ -1,6 +1,8 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'auth_service.dart';
+import 'forgot_password.dart';
+import 'google_auth_webview.dart';
 import 'linq_theme.dart';
 
 class LoginScreen extends StatefulWidget {
@@ -26,25 +28,56 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   Future<String> _resolveLoginRoute(Map<String, dynamic> result) async {
-    final responseRole = result['role']?.toString().toLowerCase();
-    final savedRole = (await AuthService.getActiveRole())?.toLowerCase();
-    final lastMode = (await AuthService.getLastAccountMode())?.toLowerCase();
-    final resolvedRole = (responseRole?.isNotEmpty == true)
-        ? responseRole
-        : (savedRole?.isNotEmpty == true)
-            ? savedRole
-            : lastMode;
-    return resolvedRole == 'provider' ? '/provider-dashboard' : '/customer-dashboard';
+    return '/customer-dashboard';
+  }
+
+  Future<void> _navigateAfterLogin(Map<String, dynamic> result) async {
+    final route = await _resolveLoginRoute(result);
+    final loginEmail = (result['email']?.toString() ?? _emailCtrl.text).trim();
+    await AuthService.setActiveRole('customer', email: loginEmail);
+    if (!mounted) return;
+    Navigator.pushNamedAndRemoveUntil(context, route, (_) => false);
   }
 
   Future<void> _googleSignIn() async {
     setState(() { _loading = true; _errorMessage = null; });
-    final result = await AuthService.signInWithGoogle();
+
+    final urlResult = await AuthService.getGoogleAuthUrl();
+    if (!mounted) return;
+    if (urlResult['success'] != true) {
+      setState(() {
+        _loading = false;
+        _errorMessage = urlResult['message'];
+      });
+      return;
+    }
+
+    final params = await Navigator.push<Map<String, String>?>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => GoogleAuthWebViewPage(
+          authUrl: urlResult['redirect_url'],
+          callbackUrlPrefix: AuthService.googleCallbackUrlPrefix,
+        ),
+      ),
+    );
+    if (!mounted) return;
+
+    final code = params?['code'];
+    if (code == null) {
+      setState(() => _loading = false);
+      return;
+    }
+
+    final result = await AuthService.completeGoogleAuth(
+      code: code,
+      state: params?['state'] ?? '',
+    );
     if (!mounted) return;
     setState(() => _loading = false);
+
     if (result['success'] == true) {
-      final route = await _resolveLoginRoute(result);
-      Navigator.pushNamedAndRemoveUntil(context, route, (_) => false);
+      await _navigateAfterLogin(result);
     } else {
       setState(() => _errorMessage = result['message']);
     }
@@ -63,8 +96,7 @@ class _LoginScreenState extends State<LoginScreen> {
     setState(() => _loading = false);
 
     if (result['success'] == true) {
-      final route = await _resolveLoginRoute(result);
-      Navigator.pushNamedAndRemoveUntil(context, route, (_) => false);
+      await _navigateAfterLogin(result);
     } else {
       setState(() => _errorMessage = result['message']);
     }
@@ -148,19 +180,19 @@ class _LoginScreenState extends State<LoginScreen> {
                       style: LinqTextStyles.bodySm.copyWith(color: LinqColors.textSecondary)),
                   const SizedBox(height: 8),
 
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.end,
-                    children: [
-                      TextButton(
-                        onPressed: () => Navigator.pushNamedAndRemoveUntil(context, '/customer-dashboard', (_) => false),
-                        child: Text('Skip as user', style: LinqTextStyles.bodyXs.copyWith(color: LinqColors.textTertiary)),
-                      ),
-                      TextButton(
-                        onPressed: () => Navigator.pushNamedAndRemoveUntil(context, '/provider-dashboard', (_) => false),
-                        child: Text('Skip as provider', style: LinqTextStyles.bodyXs.copyWith(color: LinqColors.textTertiary)),
-                      ),
-                    ],
-                  ),
+                  // Row(
+                  //   mainAxisAlignment: MainAxisAlignment.end,
+                  //   children: [
+                  //     TextButton(
+                  //       onPressed: () => Navigator.pushNamedAndRemoveUntil(context, '/customer-dashboard', (_) => false),
+                  //       child: Text('Skip as user', style: LinqTextStyles.bodyXs.copyWith(color: LinqColors.textTertiary)),
+                  //     ),
+                  //     TextButton(
+                  //       onPressed: () => Navigator.pushNamedAndRemoveUntil(context, '/provider-dashboard', (_) => false),
+                  //       child: Text('Skip as provider', style: LinqTextStyles.bodyXs.copyWith(color: LinqColors.textTertiary)),
+                  //     ),
+                  //   ],
+                  // ),
                   const SizedBox(height: 8),
 
                   SizedBox(width: double.infinity, child: _googleBtn()),
@@ -242,7 +274,12 @@ class _LoginScreenState extends State<LoginScreen> {
                   Align(
                     alignment: Alignment.centerRight,
                     child: TextButton(
-                      onPressed: () {},
+                      onPressed: () => Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const ForgotPasswordScreen(),
+                        ),
+                      ),
                       child: Text('Forgot password?',
                           style: LinqTextStyles.bodySm.copyWith(color: LinqColors.forest500)),
                     ),

@@ -1,9 +1,12 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:geocoding/geocoding.dart';
 import 'auth_service.dart';
+import 'countries_data.dart';
 import 'job_review_page.dart';
 import 'linq_theme.dart';
 import 'location_service.dart';
+import 'nigeria_lga_data.dart';
 
 class ProviderHirePage extends StatefulWidget {
   final Map<String, dynamic> provider;
@@ -20,11 +23,17 @@ class _ProviderHirePageState extends State<ProviderHirePage> {
   final _descCtrl = TextEditingController();
   final _budgetCtrl = TextEditingController();
   final _addressCtrl = TextEditingController();
+  final _areaCtrl = TextEditingController();
+  String? _selectedManualState;
+  String? _selectedManualLga;
   DateTime? _preferredDate;
   bool _sending = false;
   bool _useManualLocation = false;
   bool _alsoOpenToCategory = false;
   String? _currentLocationAddress;
+  String? _currentLocationState;
+  String? _currentLocationLga;
+  String? _currentLocationArea;
   List<Map<String, dynamic>> _availableCategories = [];
   final List<String> _selectedCategories = [];
   bool _categoriesLoading = true;
@@ -42,16 +51,38 @@ class _ProviderHirePageState extends State<ProviderHirePage> {
     _descCtrl.dispose();
     _budgetCtrl.dispose();
     _addressCtrl.dispose();
+    _areaCtrl.dispose();
     super.dispose();
   }
 
   Future<void> _loadCurrentLocation() async {
-    final cachedLocation = await LocationService.getCachedLocation();
-    if (cachedLocation != null) {
-      setState(
-        () => _currentLocationAddress = 'Current Location (Auto-detected)',
-      );
+    Map<String, dynamic>? location = await LocationService.getCachedLocation();
+    if (location == null) {
+      final fetched = await LocationService.fetchLocation();
+      if (fetched['success'] == true) location = fetched;
     }
+    if (location == null || !mounted) return;
+    setState(() {
+      _currentLocationState = location!['state'] as String?;
+      _currentLocationLga = location['lga'] as String?;
+      _currentLocationArea = location['area'] as String?;
+      _currentLocationAddress = _composeLocationLabel(
+        area: _currentLocationArea,
+        lga: _currentLocationLga,
+        state: _currentLocationState,
+      );
+    });
+  }
+
+  /// Joins area/LGA/state into a single human-readable label, e.g.
+  /// "Ikeja, Ikeja LGA, Lagos". Falls back to a generic label if reverse
+  /// geocoding didn't return any of these.
+  String _composeLocationLabel({String? area, String? lga, String? state}) {
+    final parts = [area, lga, state]
+        .where((p) => p != null && p.trim().isNotEmpty)
+        .map((p) => p!.trim())
+        .toList();
+    return parts.isEmpty ? 'Current Location (Auto-detected)' : parts.join(', ');
   }
 
   Future<void> _loadCategories() async {
@@ -208,14 +239,18 @@ class _ProviderHirePageState extends State<ProviderHirePage> {
     String? addressText;
 
     if (_useManualLocation) {
-      addressText = _addressCtrl.text.trim();
-      if (addressText.length < 5) {
+      final landmark = _addressCtrl.text.trim();
+      final area = _areaCtrl.text.trim();
+      final lga = _selectedManualLga ?? '';
+      final state = _selectedManualState ?? '';
+
+      if (state.isEmpty || lga.isEmpty || area.isEmpty) {
         if (!mounted) return;
         setState(() => _sending = false);
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              'Please enter a valid address that can be found on the map.',
+              'Please select the state and enter the LGA and area/city/town.',
               style: LinqTextStyles.bodySm.copyWith(
                 color: LinqColors.textOnBrand,
               ),
@@ -227,10 +262,29 @@ class _ProviderHirePageState extends State<ProviderHirePage> {
         );
         return;
       }
+
+      addressText = [
+        if (landmark.isNotEmpty) landmark,
+        area,
+        '$lga LGA',
+        '$state State',
+      ].join(', ');
+
+      // Default to a fallback Lagos coordinate, then try to refine it by
+      // geocoding the entered address.
       locationCoords = {
         'lat': 6.5244,
         'lng': 3.3792,
       };
+      try {
+        final results = await locationFromAddress(addressText);
+        if (results.isNotEmpty) {
+          locationCoords = {
+            'lat': results.first.latitude,
+            'lng': results.first.longitude,
+          };
+        }
+      } catch (_) {}
     } else {
       final cachedLocation = await LocationService.getCachedLocation();
       if (cachedLocation != null) {
@@ -321,7 +375,7 @@ class _ProviderHirePageState extends State<ProviderHirePage> {
       budget: budgetValue,
       budgetMode: budgetValue != null ? 'fixed' : 'negotiable',
       budgetMinKobo: budgetMinKobo,
-      locationLat: locationCoords['lat'],
+      locationLat: locationCoords!['lat'],
       locationLng: locationCoords['lng'],
       locationAddressText: addressText,
       targetProviderUlid: providerUlid,
@@ -341,12 +395,11 @@ class _ProviderHirePageState extends State<ProviderHirePage> {
         if (_preferredDate != null)
           'preferred_date': _preferredDate!.toIso8601String(),
         if (budgetValue != null) 'budget': budgetValue,
-        if (locationCoords != null)
-          'location': {
-            'lat': locationCoords['lat'],
-            'lng': locationCoords['lng'],
-            'address_text': addressText,
-          },
+        'location': {
+          'lat': locationCoords['lat'],
+          'lng': locationCoords['lng'],
+          'address_text': addressText,
+        },
         'target_provider_ulid': providerUlid,
         if (_alsoOpenToCategory) 'open_to_category_providers': true,
         'provider': widget.provider,
@@ -360,8 +413,10 @@ class _ProviderHirePageState extends State<ProviderHirePage> {
       );
     } else {
       final message = result['message']?.toString() ?? 'Failed to save job draft.';
-      if (message.contains('Authentication required') ||
+      if (result['auth_required'] == true ||
+          message.contains('Authentication required') ||
           message.contains('log in')) {
+        await AuthService.logout();
         if (!mounted) return;
         Navigator.pushNamedAndRemoveUntil(context, '/login', (_) => false);
         return;
@@ -444,8 +499,12 @@ class _ProviderHirePageState extends State<ProviderHirePage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text('Hire ${_providerName.split(' ').first}'),
+        title: Text(
+          'Hire ${_providerName.split(' ').first}',
+          style: const TextStyle(color: Colors.white),
+        ),
         backgroundColor: LinqColors.forest500,
+        iconTheme: const IconThemeData(color: Colors.white),
       ),
       backgroundColor: LinqColors.bgPageApp,
       body: SingleChildScrollView(
@@ -483,41 +542,41 @@ class _ProviderHirePageState extends State<ProviderHirePage> {
                 validator: (v) => v == null || v.trim().isEmpty ? 'Required' : null,
               ),
               const SizedBox(height: LinqSpacing.s4),
-              _label('Service categories'),
-              const SizedBox(height: LinqSpacing.s2),
-              _categoriesLoading
-                  ? const Center(child: CircularProgressIndicator())
-                  : Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: _availableCategories.map((category) {
-                        final name = category['name'] as String? ?? '';
-                        final selected = _selectedCategories.contains(name);
-                        return FilterChip(
-                          label: Text(name),
-                          selected: selected,
-                          selectedColor: LinqColors.forest500,
-                          backgroundColor: LinqColors.stone100,
-                          labelStyle: LinqTextStyles.labelSm.copyWith(
-                            color: selected
-                                ? LinqColors.textOnBrand
-                                : LinqColors.textBody,
-                          ),
-                          checkmarkColor: LinqColors.textOnBrand,
-                          side: BorderSide(
-                              color: selected
-                                  ? LinqColors.forest500
-                                  : LinqColors.borderDefault),
-                          onSelected: (val) => setState(() {
-                            if (val) {
-                              _selectedCategories.add(name);
-                            } else {
-                              _selectedCategories.remove(name);
-                            }
-                          }),
-                        );
-                      }).toList(),
-                    ),
+//_label('Service categories'),
+              // const SizedBox(height: LinqSpacing.s2),
+              // _categoriesLoading
+              //     ? const Center(child: CircularProgressIndicator())
+              //     : Wrap(
+              //         spacing: 8,
+              //         runSpacing: 8,
+              //         children: _availableCategories.map((category) {
+              //           final name = category['name'] as String? ?? '';
+              //           final selected = _selectedCategories.contains(name);
+              //           return FilterChip(
+              //             label: Text(name),
+              //             selected: selected,
+              //             selectedColor: LinqColors.forest500,
+              //             backgroundColor: LinqColors.stone100,
+              //             labelStyle: LinqTextStyles.labelSm.copyWith(
+              //               color: selected
+              //                   ? LinqColors.textOnBrand
+              //                   : LinqColors.textBody,
+              //             ),
+              //             checkmarkColor: LinqColors.textOnBrand,
+              //             side: BorderSide(
+              //                 color: selected
+              //                     ? LinqColors.forest500
+              //                     : LinqColors.borderDefault),
+              //             onSelected: (val) => setState(() {
+              //               if (val) {
+              //                 _selectedCategories.add(name);
+              //               } else {
+              //                 _selectedCategories.remove(name);
+              //               }
+              //             }),
+              //           );
+              //         }).toList(),
+              //       ),
               const SizedBox(height: LinqSpacing.s4),
               _label('Job location'),
               if (!_useManualLocation) ...[
@@ -562,22 +621,59 @@ class _ProviderHirePageState extends State<ProviderHirePage> {
                   ),
                 ),
               ] else ...[
+                DropdownButtonFormField<String>(
+                  value: _selectedManualState,
+                  decoration: linqInputDecoration(
+                    label: 'State',
+                    icon: Icons.map_outlined,
+                  ),
+                  isExpanded: true,
+                  items: (countriesAndStates['Nigeria'] ?? [])
+                      .map((s) => DropdownMenuItem(value: s, child: Text(s)))
+                      .toList(),
+                  onChanged: (val) => setState(() {
+                    _selectedManualState = val;
+                    _selectedManualLga = null;
+                  }),
+                  validator: (v) =>
+                      v == null || v.isEmpty ? 'Select a state' : null,
+                ),
+                const SizedBox(height: LinqSpacing.s4),
+                DropdownButtonFormField<String>(
+                  value: _selectedManualLga,
+                  decoration: linqInputDecoration(
+                    label: 'Local Government Area (LGA)',
+                    icon: Icons.location_city_outlined,
+                  ),
+                  isExpanded: true,
+                  items: (nigeriaLgasByState[_selectedManualState] ?? [])
+                      .map((l) => DropdownMenuItem(value: l, child: Text(l)))
+                      .toList(),
+                  onChanged: _selectedManualState == null
+                      ? null
+                      : (val) => setState(() => _selectedManualLga = val),
+                  validator: (v) =>
+                      v == null || v.isEmpty ? 'Select an LGA' : null,
+                ),
+                const SizedBox(height: LinqSpacing.s4),
+                TextFormField(
+                  controller: _areaCtrl,
+                  decoration: linqInputDecoration(
+                    label: 'Area / City / Town',
+                    icon: Icons.location_on_outlined,
+                  ),
+                  validator: (v) => v == null || v.trim().isEmpty
+                      ? 'Area/city/town is required'
+                      : null,
+                ),
+                const SizedBox(height: LinqSpacing.s4),
                 TextFormField(
                   controller: _addressCtrl,
                   maxLines: 2,
                   decoration: linqInputDecoration(
-                    label: 'Enter job address or landmark',
-                    icon: Icons.location_on_outlined,
+                    label: 'Street address or landmark (optional)',
+                    icon: Icons.signpost_outlined,
                   ),
-                  validator: (v) {
-                    if (v == null || v.trim().isEmpty) {
-                      return 'Location address is required';
-                    }
-                    if (v.trim().length < 5) {
-                      return 'Please enter a valid address';
-                    }
-                    return null;
-                  },
                 ),
                 const SizedBox(height: LinqSpacing.s2),
                 Row(
@@ -632,7 +728,7 @@ class _ProviderHirePageState extends State<ProviderHirePage> {
                 ),
               ),
               const SizedBox(height: LinqSpacing.s4),
-              _label('Budget (optional)'),
+              _label('Budget'),
               TextFormField(
                 controller: _budgetCtrl,
                 keyboardType: TextInputType.number,

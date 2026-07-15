@@ -1,11 +1,14 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'auth_service.dart';
 import 'countries_data.dart';
 import 'linq_theme.dart';
 import 'location_service.dart';
 
 class UserProfilePage extends StatefulWidget {
-  const UserProfilePage({super.key});
+  final bool showBottomNav;
+
+  const UserProfilePage({super.key, this.showBottomNav = true});
 
   @override
   State<UserProfilePage> createState() => _UserProfilePageState();
@@ -28,10 +31,13 @@ class _UserProfilePageState extends State<UserProfilePage> {
   String? _selectedState;
   final _addressCtrl = TextEditingController();
 
+  bool _fullyVerified = false;
+
   @override
   void initState() {
     super.initState();
     _loadProfile();
+    _loadVerificationStatus();
   }
 
   @override
@@ -58,10 +64,6 @@ class _UserProfilePageState extends State<UserProfilePage> {
         final firstName = user['first_name'];
         final lastName = user['last_name'];
 
-        print('[UserProfilePage] Cached profile user: $user');
-        print(
-          '[UserProfilePage] Cached first_name: $firstName, last_name: $lastName',
-        );
 
         // If cache has the name fields and they are not empty, use it
         if (firstName != null &&
@@ -96,11 +98,6 @@ class _UserProfilePageState extends State<UserProfilePage> {
       final user =
           (raw['user'] is Map ? raw['user'] : raw) as Map<String, dynamic>;
 
-      print('[UserProfilePage] API profile raw: $raw');
-      print('[UserProfilePage] API profile user: $user');
-      print(
-        '[UserProfilePage] API first_name: ${user['first_name']}, last_name: ${user['last_name']}',
-      );
 
       setState(() {
         _firstName = user['first_name'] ?? '';
@@ -122,6 +119,34 @@ class _UserProfilePageState extends State<UserProfilePage> {
         _errorMessage = result['message'];
       });
     }
+  }
+
+  Future<void> _loadVerificationStatus() async {
+    final result = await AuthService.getKycStatus();
+    if (!mounted || result['success'] != true) return;
+
+    final data = result['data'];
+    final status = data is Map
+        ? (data['data'] is Map ? data['data'] as Map : data)
+        : <String, dynamic>{};
+
+    bool boolField(List<String> keys) {
+      for (final key in keys) {
+        final value = status[key];
+        if (value is bool) return value;
+        if (value is String) return value.toLowerCase() == 'verified';
+      }
+      return false;
+    }
+
+    final phoneVerified = boolField(['phone_verified', 'is_phone_verified']);
+    final emailVerified = boolField(['email_verified', 'is_email_verified']);
+    final identityVerified = boolField(
+        ['identity_verified', 'is_identity_verified', 'kyc_verified']);
+
+    setState(() {
+      _fullyVerified = phoneVerified && emailVerified && identityVerified;
+    });
   }
 
   Future<void> _captureLocation() async {
@@ -271,12 +296,24 @@ class _UserProfilePageState extends State<UserProfilePage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: LinqColors.bgPageApp,
-      appBar: AppBar(
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: SystemUiOverlayStyle.light.copyWith(
+        statusBarColor: LinqColors.forest500,
+        statusBarIconBrightness: Brightness.light,
+        statusBarBrightness: Brightness.dark,
+      ),
+      child: Scaffold(
+        backgroundColor: LinqColors.bgPageApp,
+        appBar: AppBar(
         backgroundColor: LinqColors.forest500,
         foregroundColor: LinqColors.textOnBrand,
         elevation: 0,
+        surfaceTintColor: Colors.transparent,
+        systemOverlayStyle: SystemUiOverlayStyle.light.copyWith(
+          statusBarColor: LinqColors.forest500,
+          statusBarIconBrightness: Brightness.light,
+          statusBarBrightness: Brightness.dark,
+        ),
         title: Text(
           'My profile',
           style: LinqTextStyles.h3.copyWith(color: LinqColors.textOnBrand),
@@ -337,6 +374,9 @@ class _UserProfilePageState extends State<UserProfilePage> {
                             ),
                             const SizedBox(height: LinqSpacing.s4),
                           ],
+
+                          _verificationCard(),
+                          const SizedBox(height: LinqSpacing.s4),
 
                           _sectionCard(
                             title: 'Personal information',
@@ -477,8 +517,8 @@ class _UserProfilePageState extends State<UserProfilePage> {
                       ),
                     ),
             ),
-      bottomNavigationBar: const _BottomNav(),
-    );
+      bottomNavigationBar: widget.showBottomNav ? const _BottomNav() : null,
+    ),);
   }
 
   Widget _sectionCard({required String title, required List<Widget> children}) {
@@ -497,6 +537,66 @@ class _UserProfilePageState extends State<UserProfilePage> {
           const SizedBox(height: LinqSpacing.s4),
           ...children,
         ],
+      ),
+    );
+  }
+
+  Widget _verificationCard() {
+    return Material(
+      color: LinqColors.bgSurface,
+      borderRadius: LinqRadius.borderLg,
+      child: InkWell(
+        borderRadius: LinqRadius.borderLg,
+        onTap: () => Navigator.pushNamed(context, '/user-verification'),
+        child: Container(
+          padding: const EdgeInsets.all(LinqSpacing.s5),
+          decoration: BoxDecoration(
+            borderRadius: LinqRadius.borderLg,
+            border: Border.all(color: LinqColors.borderDefault),
+            boxShadow: LinqShadows.xs,
+          ),
+          child: Row(
+            children: [
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: LinqColors.trustBg,
+                  borderRadius: LinqRadius.borderMd,
+                ),
+                child: Icon(
+                  _fullyVerified
+                      ? Icons.verified_rounded
+                      : Icons.verified_user_outlined,
+                  color: LinqColors.trust,
+                  size: 22,
+                ),
+              ),
+              const SizedBox(width: LinqSpacing.s3),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Verification', style: LinqTextStyles.h4),
+                    const SizedBox(height: LinqSpacing.s1),
+                    Text(
+                      _fullyVerified
+                          ? 'Your identity is verified — full access unlocked'
+                          : 'Verify your identity to unlock full access to LINQ',
+                      style: LinqTextStyles.bodySm.copyWith(
+                        color: LinqColors.textSecondary,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const Icon(
+                Icons.chevron_right_rounded,
+                color: LinqColors.textTertiary,
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -722,7 +822,7 @@ class _BottomNav extends StatelessWidget {
         }
       },
       items: const [
-        BottomNavigationBarItem(icon: Icon(Icons.explore), label: 'Discovery'),
+        BottomNavigationBarItem(icon: Icon(Icons.home_rounded), label: 'Home'),
         BottomNavigationBarItem(icon: Icon(Icons.work), label: 'Jobs'),
         BottomNavigationBarItem(
           icon: Icon(Icons.account_balance_wallet),
